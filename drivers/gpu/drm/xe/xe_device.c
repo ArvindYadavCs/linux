@@ -8,6 +8,7 @@
 #include <linux/aperture.h>
 #include <linux/delay.h>
 #include <linux/fault-inject.h>
+#include <linux/pci.h>
 #include <linux/units.h>
 
 #include <drm/drm_client.h>
@@ -472,6 +473,24 @@ bool xe_device_is_admin_only(const struct xe_device *xe)
 static void xe_device_wedged_worker(struct work_struct *work)
 {
 	struct xe_device *xe = container_of(work, typeof(*xe), wedged.worker);
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+
+	/*
+	 * Stop servicing interrupts from the dead HW. xe_irq_suspend() masks
+	 * them at the source and waits for the in-flight handlers to drain, so
+	 * once it returns no Xe interrupt handler is running or will run again.
+	 *
+	 * This comes first: an interrupt handler racing with the bus master bit
+	 * going away below would otherwise be reacting to garbage.
+	 */
+	xe_irq_suspend(xe);
+
+	/*
+	 * Remove the device's ability to initiate DMA to system memory. Anything
+	 * that needs live interrupts or DMA - devcoredump capture in particular
+	 * - has already completed by the time the device is declared wedged.
+	 */
+	pci_clear_master(pdev);
 
 	/* Notify userspace of wedged device */
 	drm_dev_wedged_event(&xe->drm, xe->wedged.method, NULL);

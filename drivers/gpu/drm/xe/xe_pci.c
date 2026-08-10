@@ -1251,6 +1251,7 @@ static int xe_pci_suspend(struct device *dev)
 static int xe_pci_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
+	struct xe_device *xe = pdev_to_xe_device(pdev);
 	int err;
 
 	/* Give back the D3Cold decision to the runtime P M*/
@@ -1266,9 +1267,18 @@ static int xe_pci_resume(struct device *dev)
 	if (err)
 		return err;
 
-	pci_set_master(pdev);
+	/*
+	 * pci_restore_state() puts back the command register saved at suspend
+	 * time, so re-clear bus mastering on a wedged device instead of setting
+	 * it: the wedge isolation is only ever ended by removing or resetting
+	 * this driver instance.
+	 */
+	if (xe_device_wedged(xe))
+		pci_clear_master(pdev);
+	else
+		pci_set_master(pdev);
 
-	err = xe_pm_resume(pdev_to_xe_device(pdev));
+	err = xe_pm_resume(xe);
 	if (err)
 		return err;
 
@@ -1326,7 +1336,11 @@ static int xe_pci_runtime_resume(struct device *dev)
 		if (err)
 			return err;
 
-		pci_set_master(pdev);
+		/* See the equivalent comment in xe_pci_resume(). */
+		if (xe_device_wedged(xe))
+			pci_clear_master(pdev);
+		else
+			pci_set_master(pdev);
 	}
 
 	return xe_pm_runtime_resume(xe);

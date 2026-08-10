@@ -871,6 +871,15 @@ void xe_irq_resume(struct xe_device *xe)
 	int id;
 
 	/*
+	 * A wedged device had its interrupts disabled as part of the wedge
+	 * isolation and must stay that way for the lifetime of this driver
+	 * instance. Guarding here covers every caller at once: system resume,
+	 * runtime resume and VF post-migration recovery.
+	 */
+	if (xe_device_wedged(xe))
+		return;
+
+	/*
 	 * lock not needed:
 	 * 1. no irq will arrive before the postinstall
 	 * 2. display is not yet resumed
