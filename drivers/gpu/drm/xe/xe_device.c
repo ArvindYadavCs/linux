@@ -452,6 +452,50 @@ bool xe_device_is_admin_only(const struct xe_device *xe)
 }
 #endif
 
+/**
+ * xe_device_wedged_worker - Isolate a wedged device and notify userspace
+ * @work: the &xe_device.wedged.worker
+ *
+ * Runs once, on the first wedge transition. This is the single sleepable
+ * context in which the device is cut off from the rest of the system, which
+ * matters because xe_device_declare_wedged() is reachable from hardirq context
+ * (see xe_mert_irq_handler()) while the isolation steps below can sleep.
+ *
+ * The isolation is deliberately one-way: nothing done here is undone for this
+ * driver instance. Recovery goes through a rebind or a bus reset, which creates
+ * a new instance that re-initializes everything from scratch.
+ *
+ * The wedged uevent is sent at the very end, so that a userspace recovery agent
+ * never observes a "wedged" device that is still able to interfere with the
+ * rest of the system.
+ */
+static void xe_device_wedged_worker(struct work_struct *work)
+{
+	struct xe_device *xe = container_of(work, typeof(*xe), wedged.worker);
+
+	/* Notify userspace of wedged device */
+	drm_dev_wedged_event(&xe->drm, xe->wedged.method, NULL);
+}
+
+/**
+ * xe_device_wedged_isolation_fini - Permanently stop the wedge isolation worker
+ * @arg: the &xe_device, as an untyped devres argument
+ *
+ * Disable and drain &xe_device.wedged.worker. Everything the worker touches -
+ * interrupts, BOs, TTM and the device workqueues - is destroyed after this
+ * point, and the teardown path is itself responsible for quiescing the HW from
+ * here on.
+ *
+ * disable_work_sync() also makes any later queue_work() a no-op, so a wedge
+ * declared while the device is going away cannot resurrect the worker.
+ */
+static void xe_device_wedged_isolation_fini(void *arg)
+{
+	struct xe_device *xe = arg;
+
+	disable_work_sync(&xe->wedged.worker);
+}
+
 static void xe_device_destroy(struct drm_device *dev, void *dummy)
 {
 	struct xe_device *xe = to_xe_device(dev);
@@ -596,6 +640,8 @@ int xe_device_init_early(struct xe_device *xe)
 	err = xe_pm_init_early(xe);
 	if (err)
 		return err;
+
+	INIT_WORK(&xe->wedged.worker, xe_device_wedged_worker);
 
 	return 0;
 }
@@ -1007,6 +1053,18 @@ int xe_device_probe(struct xe_device *xe)
 	if (err)
 		return err;
 
+	/*
+	 * Registered right after xe_irq_install() and before any GT is up, so
+	 * that - devres being LIFO - the wedge isolation worker is always
+	 * drained before the interrupt, BO and TTM state it uses starts being
+	 * destroyed. Every xe_device_declare_wedged() caller sits behind an
+	 * initialized GT or an installed interrupt, so no wedge can be declared
+	 * before this point.
+	 */
+	err = devm_add_action_or_reset(xe->drm.dev, xe_device_wedged_isolation_fini, xe);
+	if (err)
+		return err;
+
 	for_each_gt(gt, xe, id) {
 		err = xe_gt_init(gt);
 		if (err)
@@ -1113,6 +1171,15 @@ err_unregister_display:
 
 void xe_device_remove(struct xe_device *xe)
 {
+	/*
+	 * Drain the wedge isolation worker before anything is unregistered or
+	 * torn down. The devres action registered in xe_device_probe() would
+	 * catch this too, but only once devres unwinding starts, which is after
+	 * xe_bo_pci_dev_remove_all() has begun destroying the BOs the worker
+	 * walks.
+	 */
+	xe_device_wedged_isolation_fini(xe);
+
 	xe_display_unregister(xe);
 
 	drm_dev_unplug(&xe->drm);
@@ -1126,6 +1193,12 @@ void xe_device_shutdown(struct xe_device *xe)
 	u8 id;
 
 	drm_dbg(&xe->drm, "Shutting down device\n");
+
+	/*
+	 * Shutdown does not unwind devres, so the worker has to be drained
+	 * explicitly before the interrupts and the GTs it uses go away.
+	 */
+	xe_device_wedged_isolation_fini(xe);
 
 	xe_display_pm_shutdown(xe);
 
@@ -1403,6 +1476,7 @@ void xe_device_set_wedged_method(struct xe_device *xe, unsigned long method)
 void xe_device_declare_wedged(struct xe_device *xe)
 {
 	struct xe_gt *gt;
+	bool first;
 	u8 id;
 
 	if (xe->wedged.mode == XE_WEDGED_MODE_NEVER) {
@@ -1410,7 +1484,8 @@ void xe_device_declare_wedged(struct xe_device *xe)
 		return;
 	}
 
-	if (!atomic_xchg(&xe->wedged.flag, 1)) {
+	first = !atomic_xchg(&xe->wedged.flag, 1);
+	if (first) {
 		xe->needs_flr_on_fini = true;
 		xe_pm_runtime_get_noresume(xe);
 		drm_err(&xe->drm,
@@ -1424,22 +1499,28 @@ void xe_device_declare_wedged(struct xe_device *xe)
 	for_each_gt(gt, xe, id)
 		xe_gt_declare_wedged(gt);
 
-	if (xe_device_wedged(xe)) {
-		/*
-		 * XE_WEDGED_MODE_UPON_ANY_HANG_NO_RESET is intended for debugging
-		 * hangs, so wedge the device with 'none' recovery method and have
-		 * it available to the user for debugging.
-		 */
-		if (xe->wedged.mode == XE_WEDGED_MODE_UPON_ANY_HANG_NO_RESET)
-			xe_device_set_wedged_method(xe, DRM_WEDGE_RECOVERY_NONE);
-		/* If no wedge recovery method is set, use default */
-		else if (!xe->wedged.method)
-			xe_device_set_wedged_method(xe, DRM_WEDGE_RECOVERY_REBIND |
-						    DRM_WEDGE_RECOVERY_BUS_RESET);
+	if (!first)
+		return;
 
-		/* Notify userspace of wedged device */
-		drm_dev_wedged_event(&xe->drm, xe->wedged.method, NULL);
-	}
+	/*
+	 * XE_WEDGED_MODE_UPON_ANY_HANG_NO_RESET is intended for debugging
+	 * hangs, so wedge the device with 'none' recovery method and have
+	 * it available to the user for debugging.
+	 */
+	if (xe->wedged.mode == XE_WEDGED_MODE_UPON_ANY_HANG_NO_RESET)
+		xe_device_set_wedged_method(xe, DRM_WEDGE_RECOVERY_NONE);
+	/* If no wedge recovery method is set, use default */
+	else if (!xe->wedged.method)
+		xe_device_set_wedged_method(xe, DRM_WEDGE_RECOVERY_REBIND |
+					    DRM_WEDGE_RECOVERY_BUS_RESET);
+
+	/*
+	 * Isolate the device and notify userspace from process context. This
+	 * function is reachable from hardirq context, and the isolation steps
+	 * performed by the worker may sleep. The worker also sends the wedged
+	 * uevent, so userspace is told only once the device is fully isolated.
+	 */
+	queue_work(xe->unordered_wq, &xe->wedged.worker);
 }
 
 /**

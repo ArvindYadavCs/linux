@@ -502,6 +502,14 @@ struct xe_device {
 		unsigned long method;
 		/** @wedged.inconsistent_reset: Inconsistent reset policy state between GTs */
 		bool inconsistent_reset;
+		/**
+		 * @wedged.worker: Isolates the device from the rest of the
+		 * system and only then notifies userspace. Queued once, on the
+		 * first wedge transition, because xe_device_declare_wedged()
+		 * can be called from hardirq context while the isolation steps
+		 * may sleep.
+		 */
+		struct work_struct worker;
 	} wedged;
 
 	/** @bo_device: Struct to control async free of BOs */
