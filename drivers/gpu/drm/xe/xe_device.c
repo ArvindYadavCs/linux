@@ -554,6 +554,14 @@ static void xe_device_wedged_worker(struct work_struct *work)
 	synchronize_srcu(&xe_wedged_srcu);
 	unmap_mapping_range(xe->drm.anon_inode->i_mapping, 0, 0, 1);
 
+	/*
+	 * New VRAM placement is already rejected at this point:
+	 * xe_ttm_vram_mgr_new() keys off xe_device_wedged(), which became true
+	 * before this worker was even queued. Nothing to do here, but the
+	 * ordering matters - the mappings above are only torn down once, so
+	 * they must not be able to come back afterwards.
+	 */
+
 	/* Notify userspace of wedged device */
 	drm_dev_wedged_event(&xe->drm, xe->wedged.method, NULL);
 }

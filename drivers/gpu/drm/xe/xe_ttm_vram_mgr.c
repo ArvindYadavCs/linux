@@ -52,11 +52,31 @@ static int xe_ttm_vram_mgr_new(struct ttm_resource_manager *man,
 			       struct ttm_resource **res)
 {
 	struct xe_ttm_vram_mgr *mgr = to_xe_ttm_vram_mgr(man);
+	struct xe_device *xe = ttm_to_xe_device(tbo->bdev);
 	struct xe_ttm_vram_mgr_resource *vres;
 	struct gpu_buddy *mm = &mgr->mm;
 	u64 size, min_page_size;
 	unsigned long lpfn;
 	int err;
+
+	/*
+	 * Once the device is wedged its VRAM must not be handed out again: the
+	 * HW can no longer move data in or out of it, and the isolation done by
+	 * the wedge worker has already dropped the CPU mappings of what was
+	 * there.
+	 *
+	 * Report the region as full rather than disabling the manager. A wedged
+	 * device can still own plenty of VRAM BOs, so the manager has to stay
+	 * alive - and its LRU non-empty - for those to be evicted, purged and
+	 * freed during unbind/remove;
+	 * ttm_resource_manager_set_used(man, false) would WARN on exactly that.
+	 *
+	 * -ENOSPC makes ttm_bo_alloc_resource() move on to the next placement,
+	 * so BOs that also allow system memory keep working. Only VRAM-only
+	 * allocations fail, which is the intent.
+	 */
+	if (xe_device_wedged(xe))
+		return -ENOSPC;
 
 	lpfn = place->lpfn;
 	if (!lpfn || lpfn > man->size >> PAGE_SHIFT)
