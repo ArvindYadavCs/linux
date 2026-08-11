@@ -786,8 +786,17 @@ static void irq_uninstall(void *arg)
 {
 	struct xe_device *xe = arg;
 
-	if (!atomic_xchg(&xe->irq.enabled, 0))
+	/*
+	 * Keyed off @installed rather than @enabled: xe_irq_suspend() clears
+	 * @enabled without handing the IRQ resources back, and a resume that
+	 * fails before it reaches xe_irq_resume() leaves it cleared. Testing
+	 * @enabled here would then skip the teardown below entirely.
+	 */
+	if (!xe->irq.installed)
 		return;
+
+	xe->irq.installed = false;
+	atomic_set(&xe->irq.enabled, 0);
 
 	xe_irq_reset(xe);
 
@@ -831,6 +840,7 @@ int xe_irq_install(struct xe_device *xe)
 	if (err)
 		return err;
 
+	xe->irq.installed = true;
 	atomic_set(&xe->irq.enabled, 1);
 
 	xe_irq_postinstall(xe);

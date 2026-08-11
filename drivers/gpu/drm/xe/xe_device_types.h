@@ -249,6 +249,15 @@ struct xe_device {
 		/** @irq.enabled: interrupts enabled on this device */
 		atomic_t enabled;
 
+		/**
+		 * @irq.installed: IRQ vectors and handlers are owned by the
+		 * driver. Unlike @irq.enabled, which only tracks whether
+		 * interrupts are currently being serviced, this tracks resource
+		 * ownership and is therefore not cleared by xe_irq_suspend().
+		 * Only touched from probe/remove, i.e. process context.
+		 */
+		bool installed;
+
 		/** @irq.msix: irq info for platforms that support MSI-X */
 		struct {
 			/** @irq.msix.nvec: number of MSI-X interrupts */
