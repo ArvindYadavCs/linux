@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/fault-inject.h>
 #include <linux/pci.h>
+#include <linux/srcu.h>
 #include <linux/units.h>
 
 #include <drm/drm_client.h>
@@ -453,6 +454,51 @@ bool xe_device_is_admin_only(const struct xe_device *xe)
 }
 #endif
 
+/*
+ * Guards the sections that must not still be running once the device has been
+ * declared wedged. Static and shared by all Xe devices, mirroring the
+ * drm_unplug_srcu that backs drm_dev_enter()/drm_dev_unplug().
+ */
+DEFINE_STATIC_SRCU(xe_wedged_srcu);
+
+/**
+ * xe_device_enter_unwedged - Enter a section that must not outlive the wedge
+ * @xe: the &xe_device
+ * @idx: pointer to an index to be passed to the matching xe_device_exit_unwedged()
+ *
+ * Marks the start of a section that may only run while the device is not
+ * wedged - typically because it is about to install a CPU mapping of device
+ * memory. xe_device_declare_wedged() sets the flag and its worker then waits
+ * for every such section to drain before tearing those mappings down, so a
+ * section that gets past this point can never leave a mapping behind.
+ *
+ * This is the wedge equivalent of drm_dev_enter(), and may be nested with it.
+ * Sections may sleep.
+ *
+ * Return: %true on success, %false if the device is already wedged, in which
+ * case the caller must not proceed and must not call xe_device_exit_unwedged().
+ */
+bool xe_device_enter_unwedged(struct xe_device *xe, int *idx)
+{
+	*idx = srcu_read_lock(&xe_wedged_srcu);
+
+	if (xe_device_wedged(xe)) {
+		srcu_read_unlock(&xe_wedged_srcu, *idx);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * xe_device_exit_unwedged - Exit a section entered with xe_device_enter_unwedged()
+ * @idx: the index returned by the matching xe_device_enter_unwedged()
+ */
+void xe_device_exit_unwedged(int idx)
+{
+	srcu_read_unlock(&xe_wedged_srcu, idx);
+}
+
 /**
  * xe_device_wedged_worker - Isolate a wedged device and notify userspace
  * @work: the &xe_device.wedged.worker
@@ -491,6 +537,22 @@ static void xe_device_wedged_worker(struct work_struct *work)
 	 * - has already completed by the time the device is declared wedged.
 	 */
 	pci_clear_master(pdev);
+
+	/*
+	 * Drop the CPU mappings of device memory that was faulted in before the
+	 * wedge. The wedged check in xe_bo_cpu_fault() only covers new faults; a
+	 * page mapped earlier keeps a valid CPU PTE into a BAR the device can no
+	 * longer service, and touching it can escalate into a bus error rather
+	 * than simply returning garbage.
+	 *
+	 * This follows drm_dev_unplug(): after the grace period, every fault
+	 * that might still have seen a non-wedged device has finished, and every
+	 * later fault is guaranteed to see the wedge and take the dummy page.
+	 * Only then can the mappings be torn down without one being reinstalled
+	 * behind us.
+	 */
+	synchronize_srcu(&xe_wedged_srcu);
+	unmap_mapping_range(xe->drm.anon_inode->i_mapping, 0, 0, 1);
 
 	/* Notify userspace of wedged device */
 	drm_dev_wedged_event(&xe->drm, xe->wedged.method, NULL);

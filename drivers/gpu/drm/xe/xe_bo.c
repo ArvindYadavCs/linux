@@ -2080,10 +2080,21 @@ static vm_fault_t xe_bo_cpu_fault(struct vm_fault *vmf)
 	struct drm_exec exec;
 	vm_fault_t ret;
 	int err = 0;
+	int wedge_idx;
 	int idx;
 
-	if (xe_device_wedged(xe) || !drm_dev_enter(&xe->drm, &idx))
+	/*
+	 * Any VRAM PTE installed below has to be torn down again by the wedge
+	 * isolation worker, so publish this fault before testing the flag: a
+	 * fault that gets past here is one the worker is guaranteed to wait for.
+	 */
+	if (!xe_device_enter_unwedged(xe, &wedge_idx))
 		return ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
+
+	if (!drm_dev_enter(&xe->drm, &idx)) {
+		xe_device_exit_unwedged(wedge_idx);
+		return ttm_bo_vm_dummy_page(vmf, vmf->vma->vm_page_prot);
+	}
 
 	ret = xe_bo_cpu_fault_fastpath(vmf, xe, bo, needs_rpm);
 	if (ret != VM_FAULT_RETRY)
@@ -2170,6 +2181,7 @@ static vm_fault_t xe_bo_cpu_fault(struct vm_fault *vmf)
 		xe_bo_put(bo);
 out:
 	drm_dev_exit(idx);
+	xe_device_exit_unwedged(wedge_idx);
 
 	return ret;
 }
