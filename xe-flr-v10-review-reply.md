@@ -66,11 +66,26 @@ triggered. In the idle case m->fence is already signalled and the TDR returns
 early on the DMA_FENCE_FLAG_SIGNALED_BIT check, which is why testing has not
 hit it.
 
-Fix: drop the xe_bo_pci_dev_remove_pinned() call from the FLR prepare path
-(see 3 below), which removes the wait entirely. The underlying issue -- that a
-kernel-queue TDR during FLR teardown leaves pending fences unsignalled -- has
-no waiter left after that, but it is still latent in patch 3's teardown and is
-worth a separate look.
+The invariant that must hold before GuC scheduling and interrupts are
+disabled is that outstanding migrate jobs are either drained or cancelled with
+their fences signalled. Neither holds today, which is what makes this a real
+deadlock rather than a theoretical one.
+
+Note that simply moving xe_tile_migrate_wait() earlier would not be a complete
+fix on its own -- it would still leave a drain-versus-submit race unless new
+migrations are blocked first. Two patches instead:
+
+  1/2 makes the cancellation branch of the invariant actually hold, by not
+      forcing the GT-reset path for a kernel queue that has been deliberately
+      killed. The TDR then falls through to xe_sched_job_set_error() and
+      signals the timed-out job plus every other pending job with -ECANCELED.
+
+  2/2 drops the xe_bo_pci_dev_remove_pinned() call from FLR prepare, which
+      removes the wait entirely (and fixes 3 below).
+
+With 1/2 in place there is no unsignalled kernel-queue fence left across the
+teardown, so the stale job is also no longer sitting on the scheduler's pending
+list when guc_exec_queue_reinit_kernel() re-initializes the queue after FLR.
 
 
 === 2. "Does this error path leave the system in an inconsistent state?" ===
@@ -93,10 +108,40 @@ evicted BOs before returning the error.
 The asymmetry is real and is a bug. The security framing is overstated for the
 configurations FLR is currently enabled for, but the fix is needed either way.
 
-Confirmed: FLR prepare calls xe_bo_pci_dev_remove_pinned(), which runs
-xe_bo_dma_unmap_pinned() over xe->pinned.late.external, and FLR resume only
-calls xe_bo_restore_map() -- early/late kernel_bo_present, GGTT only. Nothing
-on the resume side touches pinned.late.external.
+On the factual question -- does xe_bo_pci_dev_remove_pinned() really unmap
+dma-buf DMA, or is it only releasing BAR / TTM I/O / aperture state? It really
+unmaps DMA. The full chain, no inference from the name required:
+
+	static void xe_bo_pci_dev_remove_pinned(struct xe_device *xe)
+	{
+		(void)xe_bo_apply_to_pinned(xe, &xe->pinned.late.external,
+					    &xe->pinned.late.external,
+					    xe_bo_dma_unmap_pinned);
+		...
+	}
+
+	int xe_bo_dma_unmap_pinned(struct xe_bo *bo)
+	{
+		...
+		if (ttm_bo->type == ttm_bo_type_sg && ttm_bo->sg) {
+			dma_buf_unmap_attachment(ttm_bo->base.import_attach,
+						 ttm_bo->sg,
+						 DMA_BIDIRECTIONAL);
+			ttm_bo->sg = NULL;
+			xe_tt->sg = NULL;
+		} else if (xe_tt->sg) {
+			dma_unmap_sgtable(..., xe_tt->sg, DMA_BIDIRECTIONAL, 0);
+			sg_free_table(xe_tt->sg);
+			xe_tt->sg = NULL;
+		}
+		...
+	}
+
+That is dma_buf_unmap_attachment() for imported dma-bufs and dma_unmap_sgtable()
+for everything else on pinned.late.external. The IOVAs are released.
+
+And FLR resume only calls xe_bo_restore_map() -- early/late kernel_bo_present,
+GGTT only. Nothing on the resume side touches pinned.late.external.
 
 Worth adding: calling xe_bo_restore_late() in the FLR branch would not fix it
 either. The only thing that re-creates the sg is xe_bo_restore_pinned(), and
@@ -128,8 +173,24 @@ across the reset and do not need tearing down. unmap_mapping_range() still
 handles the CPU side, which is what userspace needs in order to re-fault
 against post-FLR state.
 
-This also removes the dma_fence_wait() discussed in 1, so both issues go away
-with one change. The export of xe_bo_pci_dev_remove_pinned() added in patch 4
-can be reverted along with it.
+This also removes the dma_fence_wait() discussed in 1. The export of
+xe_bo_pci_dev_remove_pinned() added in patch 4 is reverted along with its only
+new caller.
 
-Patch attached as xe-flr-v11-fixup.patch.
+One fair criticism of the original wording: "IOMMU bypass" is the wrong term,
+since an unmapped IOVA faults rather than bypassing anything, and the
+corruption/disclosure chain needs more links than were established. The
+narrower question -- does xe_bo_pci_dev_remove_pinned() invalidate DMA
+addresses that surviving GPU page tables still reference, and if so where are
+they restored before submission is re-enabled -- is the better one to ask. The
+answer to it is "yes, and nowhere", which is why the patch is still needed.
+
+Patches attached:
+
+  xe-flr-v11-fixup-1-guc-submit-tdr.patch
+  xe-flr-v11-fixup-2-pm-suspend.patch
+
+1/2 applies to current upstream and was compile-tested there (W=1, clean). The
+revert hunks in 2/2 were round-trip verified against a reconstructed v10
+post-image: applying them restores xe_bo_evict.c byte-identically to its
+current upstream state.

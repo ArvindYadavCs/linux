@@ -1,0 +1,56 @@
+From: Raag Jadav <raag.jadav@intel.com>
+Subject: [PATCH] drm/xe/guc_submit: Don't force a GT reset for a killed kernel queue
+
+timeout_needs_gt_reset() returns true unconditionally for
+EXEC_QUEUE_FLAG_KERNEL. That is the right policy for a kernel job that
+times out during normal operation -- it means the hardware is stuck and a
+GT reset (or, past the karma threshold, wedging) is the only way out.
+
+It is the wrong policy for a kernel queue that has been deliberately
+killed, which is what the FLR teardown in xe_guc_flr_prepare() does via
+xe_guc_submit_pause_abort(). There the caller does not want recovery, it
+wants the outstanding jobs cancelled. What happens instead is:
+
+  - timeout_needs_gt_reset() returns true
+  - xe_sched_invalidate_job(job, 2) is atomic_inc_return(&karma) > 2, so
+    it is false on the first pass
+  - we call xe_gt_reset_async() and "goto rearm", returning
+    DRM_GPU_SCHED_STAT_NO_HANG without ever reaching the
+    xe_sched_job_set_error() / drm_sched_for_each_pending_job() block
+
+and xe_gt_reset_async() is itself a no-op, because uc_flr_prepare() has
+already called xe_uc_reset_prepare() and so guc->submission_state.stopped
+is set; the atomic_fetch_or() in guc_submit_reset_prepare() returns the
+previous value 1 and the reset is never queued.
+
+The result is that the pending jobs on a killed kernel queue keep
+unsignalled fences across the whole teardown. Anything holding those
+fences -- a dma_resv on a bo, or an xe_migrate_wait() -- waits forever,
+and the stale job is still on the scheduler's pending list when
+guc_exec_queue_reinit_kernel() re-initializes the queue after FLR.
+
+Only force the reset path when the kernel queue has not been killed. A
+killed kernel queue falls through to the normal cancellation path, which
+signals the timed-out job and every other pending job with -ECANCELED.
+
+Behaviour for a kernel job that times out during normal operation is
+unchanged: kernel queues are only killed from deliberate teardown paths,
+never from the submission or ioctl paths.
+
+Signed-off-by: Raag Jadav <raag.jadav@intel.com>
+---
+ drivers/gpu/drm/xe/xe_guc_submit.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -1486,7 +1486,7 @@ static bool timeout_needs_gt_reset(struct xe_exec_queue *q, struct xe_sched_job *
+ 				   bool skip_timeout_check)
+ {
+ 	if (q->flags & EXEC_QUEUE_FLAG_KERNEL)
+-		return true;
++		return !exec_queue_killed(q);
+ 
+ 	return !skip_timeout_check && !xe_sched_job_started(job);
+ }
