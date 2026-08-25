@@ -1,0 +1,100 @@
+From: Raag Jadav <raag.jadav@intel.com>
+Subject: [PATCH] fixup! drm/xe/pm: Introduce xe_device_suspend/resume()
+
+Don't drop dma mappings of pinned external bos during PCIe FLR prepare.
+
+xe_bo_pci_dev_remove_pinned() is a pci_device *removal* helper. FLR is not
+removal: it resets the state of the PCI function, not the IOMMU domain the
+function is attached to, so the IOVA mappings of pinned external bos stay
+valid across the reset and do not need to be torn down.
+
+Calling it from the FLR prepare path is wrong for two reasons.
+
+First, it is unpaired. The resume side takes the flr == true branch, which
+only calls xe_bo_restore_map() (kernel bos, GGTT only) and never touches
+xe->pinned.late.external. There is also no helper that could be added to
+pair with it: the only thing that re-creates the sg is xe_bo_restore_pinned(),
+which returns early when the bo has no backup object, and FLR deliberately
+skips xe_bo_evict_all() so no backup object is ever created. The bos are
+therefore left permanently with ttm_bo->sg == NULL and xe_tt->sg == NULL
+while still pinned, still on the list, and with the device advertised as
+usable again.
+
+Second, it performs an uninterruptible, untimed dma_fence_wait() via
+xe_tile_migrate_wait() after xe_irq_suspend(). If the migrate queue has an
+in-flight job when FLR is triggered, that fence is not guaranteed to have
+been signalled: the TDR queued by xe_guc_submit_pause_abort() takes the
+timeout_needs_gt_reset() path, which is unconditionally true for
+EXEC_QUEUE_FLAG_KERNEL. drm_sched_invalidate_job(job, 2) is false on the
+first pass, so it calls xe_gt_reset_async() and goes to 'rearm' without
+signalling anything. xe_gt_reset_async() is itself a no-op here, because
+uc_flr_prepare() already set guc->submission_state.stopped via
+xe_uc_reset_prepare(). Nothing else signals the fence, so the wait never
+returns.
+
+Dropping the call removes both problems. CPU mappings are still torn down
+by unmap_mapping_range(), which is what userspace needs to re-fault against
+post-FLR state.
+
+Also revert the export of xe_bo_pci_dev_remove_pinned() added for this
+caller, since xe_bo_pci_dev_remove_all() is once again its only user.
+
+Signed-off-by: Raag Jadav <raag.jadav@intel.com>
+---
+ drivers/gpu/drm/xe/xe_bo_evict.c | 8 +-------
+ drivers/gpu/drm/xe/xe_bo_evict.h | 1 -
+ drivers/gpu/drm/xe/xe_device.c   | 14 +++++++++++---
+ 3 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_bo_evict.c b/drivers/gpu/drm/xe/xe_bo_evict.c
+--- a/drivers/gpu/drm/xe/xe_bo_evict.c
++++ b/drivers/gpu/drm/xe/xe_bo_evict.c
+@@ -299,13 +299,7 @@ int xe_bo_restore_late(struct xe_device *xe)
+ 	return ret;
+ }
+ 
+-/**
+- * xe_bo_pci_dev_remove_pinned() - Unmap external bos
+- * @xe: xe device
+- *
+- * Drop dma mappings of all external pinned bos.
+- */
+-void xe_bo_pci_dev_remove_pinned(struct xe_device *xe)
++static void xe_bo_pci_dev_remove_pinned(struct xe_device *xe)
+ {
+ 	struct xe_tile *tile;
+ 	unsigned int id;
+diff --git a/drivers/gpu/drm/xe/xe_bo_evict.h b/drivers/gpu/drm/xe/xe_bo_evict.h
+--- a/drivers/gpu/drm/xe/xe_bo_evict.h
++++ b/drivers/gpu/drm/xe/xe_bo_evict.h
+@@ -16,7 +16,6 @@ int xe_bo_restore_early(struct xe_device *xe);
+ int xe_bo_restore_late(struct xe_device *xe);
+ int xe_bo_restore_map(struct xe_device *xe);
+ 
+-void xe_bo_pci_dev_remove_pinned(struct xe_device *xe);
+ void xe_bo_pci_dev_remove_all(struct xe_device *xe);
+ 
+ int xe_bo_pinned_init(struct xe_device *xe);
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -1620,9 +1620,16 @@ int xe_device_suspend(struct xe_device *xe, bool flr)
+ 	xe_irq_suspend(xe);
+ 
+ 	if (flr) {
+-		/* TODO: Drop all user bos */
+-		xe_bo_pci_dev_remove_pinned(xe);
+-
++		/*
++		 * Note that dma mappings of pinned external bos are deliberately
++		 * left in place. FLR resets the state of the PCI function, not the
++		 * IOMMU domain it is attached to, so those mappings remain valid
++		 * across the reset. There is also nothing on the resume side that
++		 * could re-establish them: xe_bo_restore_pinned() is a no-op
++		 * without a backup object, and we skip xe_bo_evict_all() above.
++		 *
++		 * TODO: Drop all user bos
++		 */
+ 		unmap_mapping_range(xe->drm.anon_inode->i_mapping, 0, 0, 1);
+ 	} else {
+ 		xe_display_pm_suspend_late(xe);
