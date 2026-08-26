@@ -1,0 +1,116 @@
+Fixup for [PATCH v10 07/10] drm/xe/pm: Introduce xe_device_suspend/resume()
+
+Apply on top of the full v10 series:
+
+    patch -p1 -F3 < xe-flr-v11-fixup.diff
+      or
+    git apply --recount xe-flr-v11-fixup.diff
+
+Two logical changes, kept in one file for convenience. For posting upstream
+they should be split: hunk 1 is an independent fix to existing GuC submit
+code and belongs before the series; hunks 2-4 are a fixup to patches 4 and 7.
+
+1. xe_guc_submit.c
+   Don't force the GT-reset path for a kernel queue that has been
+   deliberately killed. During FLR teardown xe_guc_submit_pause_abort()
+   kills every queue including the migrate queue, but the TDR then hits
+   timeout_needs_gt_reset(), which is unconditionally true for
+   EXEC_QUEUE_FLAG_KERNEL. xe_sched_invalidate_job(job, 2) is false on the
+   first pass, so it calls xe_gt_reset_async() and returns via 'rearm'
+   without ever reaching xe_sched_job_set_error(). That reset is itself a
+   no-op, because uc_flr_prepare() already set guc->submission_state.stopped
+   and the atomic_fetch_or() in guc_submit_reset_prepare() returns 1.
+   Result: pending kernel-queue fences stay unsignalled across teardown.
+   With this change a killed kernel queue falls through to the normal
+   cancellation path and every pending job is completed with -ECANCELED.
+   Behaviour outside teardown is unchanged, since kernel queues are only
+   killed from deliberate teardown paths.
+
+2. xe_device.c
+   Don't drop dma mappings of pinned external bos during FLR prepare.
+   xe_bo_pci_dev_remove_pinned() is a pci_device *removal* helper; FLR
+   resets the state of the PCI function, not the IOMMU domain it is
+   attached to, so those mappings stay valid across the reset. The call is
+   also unpaired: the resume side takes the flr == true branch, which only
+   calls xe_bo_restore_map() and never touches xe->pinned.late.external.
+   xe_bo_restore_late() could not pair with it either, since
+   xe_bo_restore_pinned() returns early without a backup object and FLR
+   deliberately skips xe_bo_evict_all(). Removing it also drops the
+   uninterruptible, untimed dma_fence_wait() that xe_tile_migrate_wait()
+   performs after xe_irq_suspend().
+
+3. xe_bo_evict.[ch]
+   Revert the export added in patch 4, now that xe_bo_pci_dev_remove_all()
+   is once again the only caller.
+
+---
+ drivers/gpu/drm/xe/xe_bo_evict.c   |  8 +-------
+ drivers/gpu/drm/xe/xe_bo_evict.h   |  1 -
+ drivers/gpu/drm/xe/xe_device.c     | 14 +++++++++++---
+ drivers/gpu/drm/xe/xe_guc_submit.c |  2 +-
+ 4 files changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -1486,7 +1486,7 @@ static bool timeout_needs_gt_reset(struct xe_exec_queue *q, struct xe_sched_job *
+ 				   bool skip_timeout_check)
+ {
+ 	if (q->flags & EXEC_QUEUE_FLAG_KERNEL)
+-		return true;
++		return !exec_queue_killed(q);
+ 
+ 	return !skip_timeout_check && !xe_sched_job_started(job);
+ }
+diff --git a/drivers/gpu/drm/xe/xe_device.c b/drivers/gpu/drm/xe/xe_device.c
+--- a/drivers/gpu/drm/xe/xe_device.c
++++ b/drivers/gpu/drm/xe/xe_device.c
+@@ -1620,9 +1620,16 @@ int xe_device_suspend(struct xe_device *xe, bool flr)
+ 	xe_irq_suspend(xe);
+ 
+ 	if (flr) {
+-		/* TODO: Drop all user bos */
+-		xe_bo_pci_dev_remove_pinned(xe);
+-
++		/*
++		 * Note that dma mappings of pinned external bos are deliberately
++		 * left in place. FLR resets the state of the PCI function, not the
++		 * IOMMU domain it is attached to, so those mappings remain valid
++		 * across the reset. There is also nothing on the resume side that
++		 * could re-establish them: xe_bo_restore_pinned() is a no-op
++		 * without a backup object, and we skip xe_bo_evict_all() above.
++		 *
++		 * TODO: Drop all user bos
++		 */
+ 		unmap_mapping_range(xe->drm.anon_inode->i_mapping, 0, 0, 1);
+ 	} else {
+ 		xe_display_pm_suspend_late(xe);
+diff --git a/drivers/gpu/drm/xe/xe_bo_evict.c b/drivers/gpu/drm/xe/xe_bo_evict.c
+--- a/drivers/gpu/drm/xe/xe_bo_evict.c
++++ b/drivers/gpu/drm/xe/xe_bo_evict.c
+@@ -299,13 +299,7 @@ int xe_bo_restore_late(struct xe_device *xe)
+ 	return ret;
+ }
+ 
+-/**
+- * xe_bo_pci_dev_remove_pinned() - Unmap external bos
+- * @xe: xe device
+- *
+- * Drop dma mappings of all external pinned bos.
+- */
+-void xe_bo_pci_dev_remove_pinned(struct xe_device *xe)
++static void xe_bo_pci_dev_remove_pinned(struct xe_device *xe)
+ {
+ 	struct xe_tile *tile;
+ 	unsigned int id;
+diff --git a/drivers/gpu/drm/xe/xe_bo_evict.h b/drivers/gpu/drm/xe/xe_bo_evict.h
+--- a/drivers/gpu/drm/xe/xe_bo_evict.h
++++ b/drivers/gpu/drm/xe/xe_bo_evict.h
+@@ -16,7 +16,6 @@ int xe_bo_restore_early(struct xe_device *xe);
+ int xe_bo_restore_late(struct xe_device *xe);
+ int xe_bo_restore_map(struct xe_device *xe);
+ 
+-void xe_bo_pci_dev_remove_pinned(struct xe_device *xe);
+ void xe_bo_pci_dev_remove_all(struct xe_device *xe);
+ 
+ int xe_bo_pinned_init(struct xe_device *xe);
