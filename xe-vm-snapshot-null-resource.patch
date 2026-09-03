@@ -1,103 +1,79 @@
 From: Arvind Yadav <arvind.yadav.cs@gmail.com>
-Subject: [PATCH] drm/xe/vm: Read bo resource under reservation in snapshot capture
+Subject: [PATCH] drm/xe/vm: Handle NULL resource in xe_vm_snapshot_capture()
 
-xe_vm_snapshot_capture() dereferences bo->ttm.resource without holding the
-bo reservation. This is both a NULL dereference and a use-after-free.
+xe_vm_snapshot_capture() dereferences bo->ttm.resource unconditionally
+when recording the memory region of a mapped bo. A purged bo has no
+resource, so this is a NULL pointer dereference.
 
-xe_ttm_bo_purge() purges with an empty ttm_placement, so ttm_bo_validate()
-takes the ttm_bo_pipeline_gutting() path, which frees the resource via
-ttm_resource_free() and leaves bo->ttm.resource NULL. The purged bo stays
-mapped in the VM by design: xe_vm_populate_validate() skips re-populating
-it and xelp_pte_encode_bo() maps it to scratch with XE_PTE_NULL. The VMA is
-never removed, so the devcoredump walk still reaches it.
+xe_ttm_bo_purge() purges with an empty ttm_placement, which makes
+ttm_bo_validate() take the ttm_bo_pipeline_gutting() path. That frees the
+resource through ttm_resource_free(), which sets bo->ttm.resource to NULL.
 
-An already purged bo therefore oopses deterministically on the switch, and
-a bo purged concurrently with the walk is a use-after-free even if the
-pointer tested non-NULL first. Userspace only needs madvise(DONTNEED) on a
-mapped bo followed by a hang, so an unprivileged process can use this for a
-denial of service.
+The purged bo stays mapped in the VM by design: xe_vm_populate_validate()
+skips re-populating it and the rebind maps scratch pages instead, with
+xelp_pte_encode_bo() setting XE_PTE_NULL for a purged bo on a scratch VM.
+The VMA is never removed, so it is still walked by the devcoredump handler.
 
-Read the resource under dma_resv_trylock() instead. A blocking
-dma_resv_lock() is not an option here for two independent reasons: the
-capture runs inside the dma_fence_begin_signalling() section opened by
-devcoredump_snapshot(), and vm->snap_mutex, already held here, is itself
-taken under the bo reservation on the gpuva insert/remove paths, so
-blocking would invert that order.
+If a GPU hang then triggers a devcoredump on a VM holding such a bo, the
+switch on bo->ttm.resource->mem_type oopses. Userspace only needs
+madvise(DONTNEED) on a mapped bo and a subsequent hang, so an unprivileged
+process can use this for a denial of service.
 
-When the trylock fails the memory region is left unknown. That costs only
-a printed annotation, since uapi_mem_region is consumed solely by
-xe_vm_snapshot_print(), which already special-cases -1. The data itself is
-still captured by the delayed phase, where ttm_bo_access() revalidates
-bo->resource under the reservation and returns -ENODATA if it is gone.
+Record -ENODATA for a bo with no resource instead. This matches how the
+existing fallback branch reports an unusable mapping, and both consumers
+already handle it: xe_vm_snapshot_capture_delayed() skips entries whose
+data is an error pointer, and xe_vm_snapshot_print() prints the error and
+moves on. -1 is already the established uapi_mem_region sentinel for "no
+region" and xe_vm_snapshot_print() special-cases it.
 
-A bo found purged under the lock records -ENODATA immediately, which
-matches the existing fallback branch and avoids a pointless kvmalloc of
-the VMA length in xe_vm_snapshot_capture_delayed(). Both consumers already
-handle an error pointer.
+Read the resource once into a local so the NULL test and the mem_type
+access cannot see different values.
 
-Note this also changes the reported region for a mem_type outside the
-switch, such as XE_PL_STOLEN, from 0 to unknown. Previously such a bo was
-silently reported as system memory because uapi_mem_region was left at its
-kvzalloc() value.
+This deliberately does not take the bo reservation. Capture runs inside the
+dma_fence_begin_signalling() section opened by devcoredump_snapshot() and
+holds vm->snap_mutex, which is itself taken under the reservation on the
+gpuva insert/remove paths, so only a trylock would be legal. A trylock is
+not worth it here: bos bound to a VM share the VM reservation, so a single
+contended resv would blank the memory region for every bo in the dump,
+while the race it would close requires TTM eviction or swapout to purge
+that exact bo within the few instructions between the load and the
+dereference. Stale data in a coredump is acceptable; the deterministic
+NULL dereference fixed here is not.
 
 Signed-off-by: Arvind Yadav <arvind.yadav.cs@gmail.com>
 ---
 diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
-index 9e0176861c..5bcc760afd 100644
+index 9e0176861c..fa3415b2c6 100644
 --- a/drivers/gpu/drm/xe/xe_vm.c
 +++ b/drivers/gpu/drm/xe/xe_vm.c
-@@ -4526,17 +4526,43 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+@@ -4513,6 +4513,7 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+ 		struct xe_vma *vma = gpuva_to_vma(gpuva);
+ 		struct xe_bo *bo = vma->gpuva.gem.obj ?
+ 			gem_to_xe_bo(vma->gpuva.gem.obj) : NULL;
++		struct ttm_resource *res = bo ? bo->ttm.resource : NULL;
+ 
+ 		if (!(gpuva->flags & XE_VMA_DUMPABLE))
+ 			continue;
+@@ -4522,11 +4523,20 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+ 		snap->snap[i].flags = xe_vma_read_only(vma) ?
+ 			XE_VM_SNAP_FLAG_READ_ONLY : 0;
+ 		snap->snap[i].pat_index = vma->attr.pat_index;
+-		if (bo) {
++		if (bo && !res) {
++			/*
++			 * A purged bo has had its resource freed, so there is
++			 * nothing to capture. Record the error instead of
++			 * dereferencing a NULL resource; xe_bo_read() would
++			 * fail with -ENODATA for this bo anyway.
++			 */
++			snap->snap[i].data = ERR_PTR(-ENODATA);
++			snap->snap[i].uapi_mem_region = -1;
++		} else if (bo) {
  			snap->snap[i].cpu_caching = bo->cpu_caching;
  			snap->snap[i].bo = xe_bo_get(bo);
  			snap->snap[i].bo_ofs = xe_vma_bo_offset(vma);
 -			switch (bo->ttm.resource->mem_type) {
--			case XE_PL_SYSTEM:
--			case XE_PL_TT:
--				snap->snap[i].uapi_mem_region = 0;
--				break;
--			case XE_PL_VRAM0:
--				snap->snap[i].uapi_mem_region = 1;
--				break;
--			case XE_PL_VRAM1:
--				snap->snap[i].uapi_mem_region = 2;
--				break;
-+			snap->snap[i].uapi_mem_region = -1;
-+
-+			/*
-+			 * bo->ttm.resource is only stable under the bo
-+			 * reservation, which xe_ttm_bo_purge() holds while
-+			 * freeing it. Only a trylock is permitted here: this
-+			 * runs inside a dma-fence signalling critical section,
-+			 * and vm->snap_mutex is itself taken under the
-+			 * reservation on the gpuva insert/remove paths.
-+			 *
-+			 * If the lock is unavailable the memory region stays
-+			 * unknown, which costs only a printed annotation. The
-+			 * data is captured later by xe_bo_read(), and
-+			 * ttm_bo_access() revalidates the resource under the
-+			 * reservation.
-+			 */
-+			if (dma_resv_trylock(bo->ttm.base.resv)) {
-+				struct ttm_resource *res = bo->ttm.resource;
-+
-+				if (!res) {
-+					/* Purged bo, nothing left to capture. */
-+					snap->snap[i].data = ERR_PTR(-ENODATA);
-+				} else {
-+					switch (res->mem_type) {
-+					case XE_PL_SYSTEM:
-+					case XE_PL_TT:
-+						snap->snap[i].uapi_mem_region = 0;
-+						break;
-+					case XE_PL_VRAM0:
-+						snap->snap[i].uapi_mem_region = 1;
-+						break;
-+					case XE_PL_VRAM1:
-+						snap->snap[i].uapi_mem_region = 2;
-+						break;
-+					}
-+				}
-+				dma_resv_unlock(bo->ttm.base.resv);
- 			}
- 		} else if (xe_vma_is_userptr(vma)) {
- 			struct mm_struct *mm =
++			switch (res->mem_type) {
+ 			case XE_PL_SYSTEM:
+ 			case XE_PL_TT:
+ 				snap->snap[i].uapi_mem_region = 0;
