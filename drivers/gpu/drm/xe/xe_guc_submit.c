@@ -2410,6 +2410,27 @@ retry:
 
 #undef WAIT_COND
 
+	/*
+	 * The wait also completes when the GuC is stopped, and that can leave
+	 * suspend_pending set: guc_exec_queue_stop() only signals queues that
+	 * already had a suspend pending when it ran, so a suspend started after
+	 * that point stays pending for the rest of the reset. Nothing executes
+	 * while the GuC is down, so the suspend is complete - finish it here
+	 * exactly as guc_exec_queue_stop() would have, leaving the documented
+	 * postcondition (suspend done on a 0 return) true for this case too.
+	 *
+	 * Otherwise a caller that resumes after a successful wait - such as
+	 * resume_and_reinstall_preempt_fences(), whose reset_status() guard does
+	 * not catch this because guc_exec_queue_stop() clears the reset bit -
+	 * trips the !suspend_pending assert in __guc_exec_queue_resume(), and
+	 * the still-queued SUSPEND message re-suspends the queue behind it.
+	 */
+	if (ret > 0 && READ_ONCE(q->guc->suspend_pending) &&
+	    xe_guc_read_stopped(guc)) {
+		set_exec_queue_suspended(q);
+		__suspend_fence_signal(q);
+	}
+
 	return ret < 0 ? ret : 0;
 }
 
