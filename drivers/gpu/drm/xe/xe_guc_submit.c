@@ -1409,6 +1409,26 @@ static bool check_timeout(struct xe_exec_queue *q, struct xe_sched_job *job)
 	diff = ctx_timestamp - ctx_job_timestamp;
 
 	/*
+	 * The two timestamps are sampled independently and a GT reset in
+	 * between reloads the context image, which can leave the job timestamp
+	 * ahead of the context timestamp. The subtraction then underflows and
+	 * the job looks like it has been running for nearly the whole counter
+	 * range, forcing a reset on a job which has barely run. The assert
+	 * above keeps a legitimate timeout well below the ~111s that the top
+	 * half of the counter spans at 19.2MHz, so a diff there is always such
+	 * an underflow and never a real elapsed time. Treat the job as still
+	 * running and let the next TDR resample.
+	 */
+	if ((s32)diff < 0) {
+		xe_gt_dbg(gt,
+			  "Check job timeout: seqno=%u, lrc_seqno=%u, guc_id=%d, timestamp went backwards, diff=0x%08x",
+			  xe_sched_job_seqno(job), xe_sched_job_lrc_seqno(job),
+			  q->guc->id, diff);
+
+		return false;
+	}
+
+	/*
 	 * Ensure timeout is within 5% to account for an GuC scheduling latency
 	 */
 	running_time_ms =
