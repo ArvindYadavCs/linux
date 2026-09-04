@@ -102,6 +102,13 @@ static void fini_sriov(struct drm_device *drm, void *arg)
  * In this function we create dedicated workqueue that will be used
  * by the SR-IOV specific workers.
  *
+ * The workqueue is marked WQ_MEM_RECLAIM because gt_reset_worker(), which
+ * runs on the WQ_MEM_RECLAIM gt-ordered-wq, synchronously cancels the PF
+ * restart worker queued here (see xe_gt_sriov_pf_stop_prepare()). Flushing
+ * a workqueue without a rescuer from a reclaim context trips
+ * check_flush_dependency() and can stall the GT reset under memory
+ * pressure.
+ *
  * Return: 0 on success or a negative error code on failure.
  */
 int xe_sriov_init(struct xe_device *xe)
@@ -120,7 +127,8 @@ int xe_sriov_init(struct xe_device *xe)
 		xe_sriov_vf_init_early(xe);
 
 	xe_assert(xe, !xe->sriov.wq);
-	xe->sriov.wq = alloc_workqueue("xe-sriov-wq", WQ_PERCPU, 0);
+	xe->sriov.wq = alloc_workqueue("xe-sriov-wq",
+				       WQ_PERCPU | WQ_MEM_RECLAIM, 0);
 	if (!xe->sriov.wq)
 		return -ENOMEM;
 
