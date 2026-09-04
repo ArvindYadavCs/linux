@@ -1467,7 +1467,21 @@ static void enable_scheduling(struct xe_exec_queue *q)
 				 !exec_queue_pending_enable(q) ||
 				 xe_guc_read_stopped(guc) ||
 				 vf_recovery(guc), HZ * 5);
-	if ((!ret && !vf_recovery(guc)) || xe_guc_read_stopped(guc)) {
+
+	/*
+	 * A stopped GuC is one of the wake conditions above, not a failure to
+	 * respond: guc_submit_reset_prepare() sets the stopped flag and wakes
+	 * this wait on purpose, so a GT reset already in flight ends the wait
+	 * early. It owns the queue from here - guc_exec_queue_stop() clears the
+	 * pending enable and deliberately spares kernel and VM queues from the
+	 * ban, then guc_exec_queue_start() re-registers and resubmits. Banning
+	 * here fights that, and the extra reset and immediate TDR only feed the
+	 * reset that is already running.
+	 */
+	if (xe_guc_read_stopped(guc))
+		return;
+
+	if (!ret && !vf_recovery(guc)) {
 		xe_gt_warn(guc_to_gt(guc), "Schedule enable failed to respond");
 		set_exec_queue_banned(q);
 		xe_gt_reset_async(q->gt);
