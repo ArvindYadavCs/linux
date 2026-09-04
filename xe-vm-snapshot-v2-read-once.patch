@@ -1,0 +1,79 @@
+From: Arvind Yadav <arvind.yadav@intel.com>
+Subject: [PATCH v2] drm/xe: Handle purged BOs in VM snapshots
+
+A purged BO can remain in a VM after its TTM resource has been freed.
+xe_vm_snapshot_capture() can then dereference a NULL resource while
+capturing a devcoredump.
+
+The resource is only stable under the bo reservation, which cannot be
+taken here: this runs in the dma_fence_begin_signalling() section opened by
+devcoredump_snapshot(), and vm->snap_mutex, held here, is itself taken
+under the reservation on the gpuva insert and remove paths.
+
+Read the resource once with READ_ONCE() so the NULL test and the mem_type
+access cannot disagree, and record -ENODATA when it is gone. Both consumers
+already handle an error pointer: xe_vm_snapshot_capture_delayed() skips
+such entries and xe_vm_snapshot_print() reports the error.
+
+This closes the NULL dereference and the TOCTOU. A concurrent free between
+the read and the dereference remains possible and would be visible to
+KASAN; fixing that requires resolving the region outside the signalling
+path, which is left to a follow-up.
+
+Fixes: ad9843aac91a ("drm/xe/madvise: Implement purgeable buffer object support")
+Signed-off-by: Arvind Yadav <arvind.yadav@intel.com>
+---
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 9e0176861c..c682587453 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -4513,6 +4513,7 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+ 		struct xe_vma *vma = gpuva_to_vma(gpuva);
+ 		struct xe_bo *bo = vma->gpuva.gem.obj ?
+ 			gem_to_xe_bo(vma->gpuva.gem.obj) : NULL;
++		struct ttm_resource *res;
+ 
+ 		if (!(gpuva->flags & XE_VMA_DUMPABLE))
+ 			continue;
+@@ -4526,17 +4527,30 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+ 			snap->snap[i].cpu_caching = bo->cpu_caching;
+ 			snap->snap[i].bo = xe_bo_get(bo);
+ 			snap->snap[i].bo_ofs = xe_vma_bo_offset(vma);
+-			switch (bo->ttm.resource->mem_type) {
+-			case XE_PL_SYSTEM:
+-			case XE_PL_TT:
+-				snap->snap[i].uapi_mem_region = 0;
+-				break;
+-			case XE_PL_VRAM0:
+-				snap->snap[i].uapi_mem_region = 1;
+-				break;
+-			case XE_PL_VRAM1:
+-				snap->snap[i].uapi_mem_region = 2;
+-				break;
++			snap->snap[i].uapi_mem_region = -1;
++
++			/*
++			 * The resource is only stable under the bo reservation,
++			 * which cannot be taken from the signalling path. Read it
++			 * once so the NULL test and the mem_type access cannot
++			 * disagree; a concurrent free is still possible here.
++			 */
++			res = READ_ONCE(bo->ttm.resource);
++			if (!res) {
++				snap->snap[i].data = ERR_PTR(-ENODATA);
++			} else {
++				switch (res->mem_type) {
++				case XE_PL_SYSTEM:
++				case XE_PL_TT:
++					snap->snap[i].uapi_mem_region = 0;
++					break;
++				case XE_PL_VRAM0:
++					snap->snap[i].uapi_mem_region = 1;
++					break;
++				case XE_PL_VRAM1:
++					snap->snap[i].uapi_mem_region = 2;
++					break;
++				}
+ 			}
+ 		} else if (xe_vma_is_userptr(vma)) {
+ 			struct mm_struct *mm =

@@ -1,0 +1,110 @@
+From: Arvind Yadav <arvind.yadav@intel.com>
+Subject: [PATCH] drm/xe: Resolve snapshot memory region under the bo reservation
+
+xe_vm_snapshot_capture() reads bo->ttm.resource to record the memory
+region of a mapped bo. That read is unlocked, and the resource is only
+stable under the bo reservation, which xe_ttm_bo_purge() and the eviction
+paths hold while freeing it. A purged bo therefore oopses on the NULL
+resource, and adding a NULL test in place only narrows the window into a
+use-after-free of the freed resource.
+
+The reservation cannot be taken in xe_vm_snapshot_capture(): it runs in the
+dma_fence_begin_signalling() section opened by devcoredump_snapshot(), and
+vm->snap_mutex, held there, is itself taken under the reservation on the
+gpuva insert and remove paths.
+
+The region is only metadata, though, and nothing needs it before the dump
+is formatted. Resolve it in xe_vm_snapshot_capture_delayed() instead, which
+runs from a worker where the reservation can simply be taken. This is the
+same pattern xe_lrc_snapshot_capture_delayed() already uses to read its bo.
+
+That removes the unlocked resource dereference entirely rather than making
+it less likely to crash. A bo found purged under the lock records -ENODATA,
+which both consumers already handle, and skips the kvmalloc() of the VMA
+length that would otherwise be freed again as soon as xe_bo_read() failed.
+
+As a side effect the reported region and the captured data are now taken at
+the same point. Previously the region came from hang time while the data
+was read later in the worker, so an eviction in between made the two
+disagree with no indication in the output.
+
+Note this also changes the reported region for a mem_type outside the
+switch, such as XE_PL_STOLEN, from 0 to unknown. Previously such a bo was
+silently reported as system memory because uapi_mem_region kept its
+kvzalloc() value.
+
+Fixes: ad9843aac91a ("drm/xe/madvise: Implement purgeable buffer object support")
+Signed-off-by: Arvind Yadav <arvind.yadav@intel.com>
+---
+diff --git a/drivers/gpu/drm/xe/xe_vm.c b/drivers/gpu/drm/xe/xe_vm.c
+index 9e0176861c..fc8ad00e9c 100644
+--- a/drivers/gpu/drm/xe/xe_vm.c
++++ b/drivers/gpu/drm/xe/xe_vm.c
+@@ -4526,18 +4526,14 @@ struct xe_vm_snapshot *xe_vm_snapshot_capture(struct xe_vm *vm)
+ 			snap->snap[i].cpu_caching = bo->cpu_caching;
+ 			snap->snap[i].bo = xe_bo_get(bo);
+ 			snap->snap[i].bo_ofs = xe_vma_bo_offset(vma);
+-			switch (bo->ttm.resource->mem_type) {
+-			case XE_PL_SYSTEM:
+-			case XE_PL_TT:
+-				snap->snap[i].uapi_mem_region = 0;
+-				break;
+-			case XE_PL_VRAM0:
+-				snap->snap[i].uapi_mem_region = 1;
+-				break;
+-			case XE_PL_VRAM1:
+-				snap->snap[i].uapi_mem_region = 2;
+-				break;
+-			}
++			/*
++			 * The memory region is resolved in the delayed phase,
++			 * where the bo reservation can be taken. Reading
++			 * bo->ttm.resource here would be unlocked: this runs in
++			 * the dma-fence signalling path, and eviction or purge
++			 * can free the resource concurrently.
++			 */
++			snap->snap[i].uapi_mem_region = -1;
+ 		} else if (xe_vma_is_userptr(vma)) {
+ 			struct mm_struct *mm =
+ 				to_userptr_vma(vma)->userptr.notifier.mm;
+@@ -4578,6 +4574,40 @@ void xe_vm_snapshot_capture_delayed(struct xe_vm_snapshot *snap)
+ 		    snap->snap[i].flags & XE_VM_SNAP_FLAG_IS_NULL)
+ 			continue;
+ 
++		if (bo) {
++			bool purged;
++
++			/*
++			 * bo->ttm.resource is only stable under the bo
++			 * reservation. Unlike xe_vm_snapshot_capture() this runs
++			 * from a worker, so the lock can be taken here; see
++			 * xe_lrc_snapshot_capture_delayed() for the same pattern.
++			 */
++			xe_bo_lock(bo, false);
++			purged = !bo->ttm.resource;
++			if (!purged) {
++				switch (bo->ttm.resource->mem_type) {
++				case XE_PL_SYSTEM:
++				case XE_PL_TT:
++					snap->snap[i].uapi_mem_region = 0;
++					break;
++				case XE_PL_VRAM0:
++					snap->snap[i].uapi_mem_region = 1;
++					break;
++				case XE_PL_VRAM1:
++					snap->snap[i].uapi_mem_region = 2;
++					break;
++				}
++			}
++			xe_bo_unlock(bo);
++
++			if (purged) {
++				/* Purged bo, nothing left to capture. */
++				snap->snap[i].data = ERR_PTR(-ENODATA);
++				goto cleanup_bo;
++			}
++		}
++
+ 		snap->snap[i].data = kvmalloc(snap->snap[i].len, GFP_USER);
+ 		if (!snap->snap[i].data) {
+ 			snap->snap[i].data = ERR_PTR(-ENOMEM);
