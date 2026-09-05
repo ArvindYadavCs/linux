@@ -2209,6 +2209,37 @@ static u32 xe_migrate_copy_pitch(struct xe_device *xe, u32 len)
 	return pitch;
 }
 
+/*
+ * Bound the VRAM side of a migration against the tile's physical VRAM.
+ *
+ * Every address the blitter sees is derived from this one, and nothing
+ * between xe_page_to_dpa() and emit_copy() validates it - the checks on that
+ * path are all xe_assert(), which compiles out unless CONFIG_DRM_XE_DEBUG is
+ * set. A bad value is therefore programmed straight into the copy command,
+ * where it becomes a pagefault against the migrate VM (ASID 0), an
+ * unserviceable fault response, and a GuC CAT error on the kernel migrate
+ * queue - none of which names the address that caused it.
+ *
+ * Reject it here instead, while we can still say what it was.
+ */
+static bool xe_migrate_vram_range_valid(struct xe_device *xe, u64 vram_addr,
+					unsigned long len)
+{
+	u64 dpa_base = xe_vram_region_dpa_base(xe->mem.vram);
+	u64 vram_size = xe_vram_region_actual_physical_size(xe->mem.vram);
+
+	/* Written to avoid overflow on a wild vram_addr or len */
+	if (vram_addr >= dpa_base && len <= vram_size &&
+	    vram_addr - dpa_base <= vram_size - len)
+		return true;
+
+	drm_err_ratelimited(&xe->drm,
+			    "migrate: VRAM address 0x%016llx len 0x%lx outside [0x%016llx, 0x%016llx)\n",
+			    vram_addr, len, dpa_base, dpa_base + vram_size);
+
+	return false;
+}
+
 static struct dma_fence *xe_migrate_vram(struct xe_migrate *m,
 					 unsigned long len,
 					 unsigned long sram_offset,
@@ -2236,6 +2267,9 @@ static struct dma_fence *xe_migrate_vram(struct xe_migrate *m,
 	    drm_WARN_ON(&xe->drm,
 			(!IS_ALIGNED(len, pitch)) || (sram_offset | vram_addr) & XE_CACHELINE_MASK))
 		return ERR_PTR(-EOPNOTSUPP);
+
+	if (!xe_migrate_vram_range_valid(xe, vram_addr, len))
+		return ERR_PTR(-EINVAL);
 
 	xe_assert(xe, npages * PAGE_SIZE <= MAX_PREEMPTDISABLE_TRANSFER);
 
