@@ -2902,6 +2902,20 @@ static void guc_exec_queue_start(struct xe_exec_queue *q)
 			}
 		}
 		xe_sched_resubmit_jobs(sched);
+	} else if (xe_sched_first_pending_job(sched)) {
+		/*
+		 * A pending job on a queue that cannot be resubmitted will
+		 * never start, yet the TDR resumed below keeps firing on it:
+		 * check_timeout() reports it as not started, which for a
+		 * kernel queue means another GT reset every timeout period
+		 * until the karma threshold wedges the device. Name the state
+		 * that blocked resubmission - it is the only thing that
+		 * distinguishes this from a job the hardware is genuinely
+		 * refusing to run.
+		 */
+		xe_gt_dbg(q->gt,
+			  "Not resubmitting after reset: guc_id=%d, flags=0x%lx, state=0x%x\n",
+			  q->guc->id, q->flags, atomic_read(&q->guc->state));
 	}
 
 	xe_sched_submission_start(sched);
