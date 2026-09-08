@@ -2630,6 +2630,7 @@ static void guc_exec_queue_stop(struct xe_guc *guc, struct xe_exec_queue *q)
 {
 	struct xe_gpu_scheduler *sched = &q->guc->sched;
 	bool do_destroy = false;
+	u32 keep_state;
 
 	/* Stop scheduling + flush any DRM scheduler operations */
 	xe_sched_submission_stop(sched);
@@ -2643,10 +2644,20 @@ static void guc_exec_queue_stop(struct xe_guc *guc, struct xe_exec_queue *q)
 		set_exec_queue_suspended(q);
 		suspend_fence_signal(q);
 	}
-	atomic_and(EXEC_QUEUE_STATE_WEDGED | EXEC_QUEUE_STATE_BANNED |
-		   EXEC_QUEUE_STATE_KILLED | EXEC_QUEUE_STATE_DESTROYED |
-		   EXEC_QUEUE_STATE_SUSPENDED,
-		   &q->guc->state);
+	/*
+	 * Keep the state that outlives a reset. BANNED is not part of that for
+	 * a kernel or VM queue: the ban below deliberately spares them, so a
+	 * ban carried in from a timeout would contradict that policy and make
+	 * guc_exec_queue_start() skip the replay for good, stranding the very
+	 * job this reset is recovering. A queue that must stay dead is marked
+	 * KILLED or WEDGED, and both still block the replay.
+	 */
+	keep_state = EXEC_QUEUE_STATE_WEDGED | EXEC_QUEUE_STATE_KILLED |
+		     EXEC_QUEUE_STATE_DESTROYED | EXEC_QUEUE_STATE_SUSPENDED;
+	if (!(q->flags & (EXEC_QUEUE_FLAG_KERNEL | EXEC_QUEUE_FLAG_VM)))
+		keep_state |= EXEC_QUEUE_STATE_BANNED;
+
+	atomic_and(keep_state, &q->guc->state);
 	q->guc->resume_time = 0;
 	trace_xe_exec_queue_stop(q);
 
