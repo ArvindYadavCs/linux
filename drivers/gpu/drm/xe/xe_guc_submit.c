@@ -1655,6 +1655,19 @@ trigger_reset:
 			xe_devcoredump(primary, job,
 				       "Schedule disable failed to respond, guc_id=%d, ret=%d, guc_read=%d",
 				       primary->guc->id, ret, xe_guc_read_stopped(guc));
+
+			/*
+			 * The reset is the recovery, and guc_exec_queue_start()
+			 * replays nothing for a queue that is still marked
+			 * banned. The ban above only had to keep the job off the
+			 * hardware while the disable was outstanding, so drop it
+			 * - exactly as the reset arm below does - and let the
+			 * reset resubmit. A queue that was already banned when
+			 * this timeout started stays banned.
+			 */
+			if (!skip_timeout_check)
+				clear_exec_queue_banned(q);
+
 			xe_gt_reset_async(primary->gt);
 			xe_sched_tdr_queue_imm(sched);
 			goto rearm;
