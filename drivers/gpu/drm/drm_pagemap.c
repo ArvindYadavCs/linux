@@ -986,7 +986,12 @@ static void drm_pagemap_release(struct kref *ref)
 	dpagemap->dev_hold = NULL;
 	drm_pagemap_shrinker_add(dpagemap);
 	llist_add(&dev_hold->link, &drm_pagemap_unhold_list);
-	schedule_work(&drm_pagemap_work);
+	/*
+	 * Use an unbound workqueue. The drain below is unbatched and can
+	 * process a large number of items, which would otherwise trip the
+	 * concurrency-managed per-CPU worker CPU-intensive detector.
+	 */
+	queue_work(system_dfl_wq, &drm_pagemap_work);
 	/*
 	 * Here, either the provider device is still alive, since if called from
 	 * page_free(), the caller is holding a reference on the dev_pagemap,
