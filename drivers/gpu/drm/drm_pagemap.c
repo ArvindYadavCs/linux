@@ -1018,6 +1018,11 @@ static void drm_pagemap_dev_unhold_work(struct work_struct *work)
 		drm_dev_put(drm);
 		module_put(module);
 		kfree(dev_hold);
+		/*
+		 * The number of items drained here is not bounded, so give
+		 * non-preemptible kernels a scheduling point.
+		 */
+		cond_resched();
 	}
 }
 
