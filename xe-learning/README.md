@@ -53,4 +53,4 @@ We never move to the next chapter until both beats of the current one land.
 
 ## Chapters written so far
 
-* [01 — The Cast](01-the-cast.md)
+* [01 — The Cast](01-the-cast.md) — story + code
