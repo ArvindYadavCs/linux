@@ -316,3 +316,478 @@ let the dependency system sort it out.**
    waits on the fences already on the clipboard.
 
 </details>
+
+---
+
+# Chapter 3 — Beat B: The Code
+
+Paths are `drivers/gpu/drm/xe/` unless stated. Line numbers are **v7.3-rc1**.
+
+## 1. The nesting doll, annotated
+
+`xe_bo_types.h`, with each field tagged by which story it belongs to:
+
+```c
+struct xe_bo {
+	struct ttm_buffer_object ttm;      /* the two layers below, embedded   */
+
+	/* --- identity / ownership --- */
+	struct xe_vm *vm;                  /* NULL for "external" objects      */
+	struct xe_tile *tile;              /* kernel BOs only                  */
+	u32 flags;                         /* the XE_BO_FLAG_* word            */
+	struct dma_buf *dma_buf;           /* if imported                      */
+
+	/* --- placement (chapter 2) --- */
+	struct ttm_place placements[XE_BO_MAX_PLACEMENTS];
+	struct ttm_placement placement;
+
+	/* --- addressing (chapter 5) --- */
+	struct xe_ggtt_node *ggtt_node[XE_MAX_TILES_PER_DEVICE];
+
+	/* --- CPU mapping --- */
+	struct iosys_map vmap;
+	struct ttm_bo_kmap_obj kmap;
+	u16 cpu_caching;
+
+	/* --- list membership --- */
+	struct list_head pinned_link;
+	struct list_head vram_userfault_link;
+	struct llist_node freed;           /* deferred free list               */
+};
+```
+
+And one level down (`include/drm/ttm/ttm_bo.h`):
+
+```c
+struct ttm_buffer_object {
+	struct drm_gem_object base;        /* <- the bottom layer              */
+	struct ttm_device *bdev;
+	enum ttm_bo_type type;             /* device / kernel / sg             */
+	struct kref kref;
+	struct ttm_resource *resource;     /* WHERE  (may be NULL)             */
+	struct ttm_tt *ttm;                /* PAGES  (may be NULL)             */
+	struct ttm_lru_bulk_move *bulk_move;
+	unsigned pin_count;
+	struct sg_table *sg;
+};
+```
+
+`resource` and `ttm` both being nullable pointers is the "object is not its
+bytes" idea, spelled in C.
+
+The conversions (`xe_bo.h`):
+
+```c
+ttm_to_xe_bo(tbo)    /* container_of upward from TTM  */
+gem_to_xe_bo(obj)    /* container_of upward from GEM  */
+&bo->ttm.base        /* downward: xe_bo -> gem object */
+xe_bo_device(bo)     /* -> struct xe_device *         */
+```
+
+## 2. The GEM vtable — `xe_bo.c:2256`
+
+```c
+static const struct drm_gem_object_funcs xe_gem_object_funcs = {
+	.free   = xe_gem_object_free,      /* :1882 */
+	.close  = xe_gem_object_close,
+	.mmap   = xe_gem_object_mmap,
+	.export = xe_gem_prime_export,     /* dma-buf export */
+	.vm_ops = &xe_gem_vm_ops,          /* CPU page faults */
+};
+```
+
+Five entries. That's the entire surface GEM needs from a driver: how to free
+it, what happens when a handle closes, how to mmap it, how to export it, and
+what to do on a CPU page fault into its mapping.
+
+## 3. The uAPI — `include/uapi/drm/xe_drm.h`
+
+```c
+struct drm_xe_gem_create {
+	__u64 extensions;
+	__u64 size;
+	__u32 placement;                 /* the memory-region bitmask */
+#define DRM_XE_GEM_CREATE_FLAG_DEFER_BACKING        (1 << 0)
+#define DRM_XE_GEM_CREATE_FLAG_SCANOUT              (1 << 1)
+#define DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM   (1 << 2)
+#define DRM_XE_GEM_CREATE_FLAG_NO_COMPRESSION       (1 << 3)
+	__u32 flags;
+	__u32 vm_id;
+	__u32 handle;                    /* OUT */
+#define DRM_XE_GEM_CPU_CACHING_WB  1
+#define DRM_XE_GEM_CPU_CACHING_WC  2
+	__u16 cpu_caching;
+	__u16 pad[3];
+	__u64 reserved[2];
+};
+```
+
+Four flags and a caching mode. Compare with i915's `GEM_CREATE_EXT` zoo — the
+uAPI restraint is deliberate.
+
+## 4. `xe_gem_create_ioctl()` — `xe_bo.c:3515`
+
+### Argument validation
+
+```c
+if (XE_IOCTL_DBG(xe, (args->placement & ~xe->info.mem_region_mask) ||
+		 !args->placement))
+	return -EINVAL;
+```
+
+`mem_region_mask` — built during probe back in Chapter 1, reported to
+userspace by `DEVICE_QUERY`, and here used to reject regions this device
+doesn't have. The loop closes.
+
+`XE_IOCTL_DBG` is worth knowing: it evaluates the condition, and *if debug is
+enabled* also prints which check rejected the ioctl. When userspace gets a
+mysterious `-EINVAL` from Xe, `drm.debug` plus this macro tells you the exact
+line.
+
+### Flags translation — the bit trick
+
+```c
+bo_flags |= args->placement << (ffs(XE_BO_FLAG_SYSTEM) - 1);
+```
+
+One line converts the uAPI region mask into driver flags. It works because
+the two bit layouts were **deliberately designed one shift apart**:
+
+```
+  uAPI placement bit 0 (system) --> XE_BO_FLAG_SYSTEM = BIT(1)
+  uAPI placement bit 1 (vram0)  --> XE_BO_FLAG_VRAM0  = BIT(2)
+  uAPI placement bit 2 (vram1)  --> XE_BO_FLAG_VRAM1  = BIT(3)
+```
+
+Remember `mem_region_mask |= BIT(vram->id) << 1` in `xe_tile_init_noalloc()`?
+Same alignment, from the other end.
+
+### The caching rules
+
+```c
+if (XE_IOCTL_DBG(xe, bo_flags & XE_BO_FLAG_VRAM_MASK &&
+		 args->cpu_caching != DRM_XE_GEM_CPU_CACHING_WC))
+	return -EINVAL;
+
+if (XE_IOCTL_DBG(xe, bo_flags & XE_BO_FLAG_FORCE_WC &&
+		 args->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB))
+	return -EINVAL;
+```
+
+Beat A's rule of thumb, enforced as policy:
+* **VRAM must be WC.** Device memory reached over the BAR cannot be sanely
+  cached by the CPU.
+* **Scanout must not be WB.** `DRM_XE_GEM_CREATE_FLAG_SCANOUT` sets
+  `XE_BO_FLAG_FORCE_WC` at `:3557`, because the display engine reads the
+  framebuffer without snooping CPU caches.
+
+### `xe_validation_guard()` — the retry loop
+
+```c
+err = 0;
+xe_validation_guard(&ctx, &xe->val, &exec,
+		    (struct xe_val_flags) {.interruptible = true}, err) {
+	if (vm) {
+		err = xe_vm_drm_exec_lock(vm, &exec);
+		drm_exec_retry_on_contention(&exec);
+		if (err)
+			break;
+	}
+	bo = xe_bo_create_user(xe, vm, args->size, args->cpu_caching,
+			       bo_flags, &exec);
+	drm_exec_retry_on_contention(&exec);
+	if (IS_ERR(bo)) {
+		err = PTR_ERR(bo);
+		xe_validation_retry_on_oom(&ctx, &err);
+		break;
+	}
+}
+```
+
+This is Xe-specific scaffolding you won't find in older DRM drivers, and it
+looks strange until you see what it is: **a loop body that can be restarted.**
+
+Creating a buffer can fail two *recoverable* ways:
+
+1. **Lock contention.** The ww_mutex from Beat A wounded us — another thread
+   locking the same set of objects won the race. `drm_exec_retry_on_contention()`
+   unwinds every lock taken so far and jumps back to the top.
+2. **Out of memory.** No space, and the eviction we tried wasn't enough.
+   `xe_validation_retry_on_oom()` escalates to *exhaustive* eviction — taking a
+   device-wide lock so one allocator can evict everything without racing
+   others — and retries.
+
+`xe_validation_guard` is `scoped_guard()` + `drm_exec_until_all_locked()`
+(`xe_validation.h:188`), so the retry is a real `goto`-based loop and cleanup
+happens automatically on scope exit.
+
+**Read the braces as "try this; it may run several times."** Once that clicks,
+this pattern appears all over Xe and stops being noise.
+
+## 5. Down the create path
+
+```
+xe_gem_create_ioctl()                       :3515
+  └─ xe_bo_create_user()                    :2808   adds XE_BO_FLAG_USER
+     └─ __xe_bo_create_locked()             :2522   VM linkage, GGTT insert
+        └─ xe_bo_init_locked()              :2321   the real work
+           └─ ttm_bo_init_reserved()                TTM takes over
+```
+
+### `__xe_bo_create_locked()` — `:2522`
+
+```c
+bo = xe_bo_init_locked(xe, bo, tile,
+		       vm ? xe_vm_resv(vm) : NULL,          /* shared resv!   */
+		       vm && !xe_vm_in_fault_mode(vm) &&
+		       flags & XE_BO_FLAG_USER ?
+		       &vm->lru_bulk_move : NULL,            /* shared LRU move */
+		       size, cpu_caching, type, flags, NULL, exec);
+```
+
+Two decisions in that call, both important later:
+
+* **`xe_vm_resv(vm)`** — a BO created against a VM **shares the VM's
+  reservation object** instead of having its own. That means locking the VM
+  locks all of its buffers at once. It's the single biggest reason Xe's
+  submission path is cheap: a VM with 5000 private buffers is one lock, not
+  5000.
+* **`&vm->lru_bulk_move`** — the BO joins the VM's bulk-LRU group, so TTM
+  moves the whole VM's buffers up the LRU list in one operation rather than
+  one at a time.
+
+Then, if `XE_BO_FLAG_GGTT` is set, it inserts the BO into each requested
+tile's GGTT right here at `:2560`. That's Chapter 5.
+
+### `xe_bo_init_locked()` — `:2321`
+
+The alignment logic first:
+
+```c
+if (flags & (XE_BO_FLAG_VRAM_MASK | XE_BO_FLAG_STOLEN) &&
+    !(flags & XE_BO_FLAG_IGNORE_MIN_PAGE_SIZE) &&
+    ((xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K) ||
+     (flags & (XE_BO_FLAG_NEEDS_64K | XE_BO_FLAG_NEEDS_2M | XE_BO_FLAG_NEEDS_1G)))) {
+	if (flags & XE_BO_FLAG_NEEDS_1G)      align = SZ_1G;
+	else if (flags & XE_BO_FLAG_NEEDS_2M) align = SZ_2M;
+	else                                  align = SZ_64K;
+	...
+}
+```
+
+Some hardware **requires** 64K pages in VRAM (`XE_VRAM_FLAGS_NEED64K`); large
+pages are an optimization elsewhere. Either way the alignment lands in
+`tbo->page_alignment`, which Chapter 2's buddy allocator read as
+`min_page_size`. Two chapters, one variable.
+
+Then the wiring:
+
+```c
+bo->ttm.base.funcs = &xe_gem_object_funcs;
+bo->ttm.priority = XE_BO_PRIORITY_NORMAL;
+drm_gem_private_object_init(&xe->drm, &bo->ttm.base, size);   /* GEM layer up */
+
+if (resv) {
+	ctx.allow_res_evict = !(flags & XE_BO_FLAG_NO_RESV_EVICT);
+	ctx.resv = resv;
+}
+
+if (!(flags & XE_BO_FLAG_FIXED_PLACEMENT))
+	err = __xe_bo_placement_for_flags(xe, bo, bo->flags, type);   /* ch 2 */
+
+err = ttm_bo_init_reserved(&xe->ttm, &bo->ttm, type,
+			   placement, alignment, &ctx, NULL, resv,
+			   xe_ttm_bo_destroy);
+```
+
+`ctx.resv` tells TTM *"I already hold this lock — don't try to take it, and
+don't evict objects sharing it."* That's how shared-resv VMs stay deadlock-free
+during eviction.
+
+And note the placement override just above:
+
+```c
+placement = (type == ttm_bo_type_sg ||
+	     bo->flags & XE_BO_FLAG_DEFER_BACKING) ? &sys_placement : &bo->placement;
+```
+
+`DEFER_BACKING` (the uAPI flag) and imported dma-bufs get a bare
+`XE_PL_SYSTEM` placement — created in the parking yard, backed later. Beat A's
+"a crate may be empty," as one ternary.
+
+### The KERNEL fence wait — `:2457`
+
+The end of the function, and the payoff of story §7:
+
+```c
+if (type == ttm_bo_type_kernel) {
+	long timeout = dma_resv_wait_timeout(bo->ttm.base.resv,
+					     DMA_RESV_USAGE_KERNEL,
+					     ctx.interruptible,
+					     MAX_SCHEDULE_TIMEOUT);
+	...
+}
+```
+
+Read the asymmetry carefully. **Kernel buffers block here; user buffers do
+not.** The comment above it explains why: userspace objects already go through
+a dependency system that will wait on the clear fence before anything reads
+them, so blocking would be pure latency. Internal driver callers mostly write
+to their buffer with the CPU immediately after creating it and were never
+written to expect an in-flight async clear — so Xe pays the wait for them.
+
+## 6. The page list — `xe_ttm_tt_create()` at `:471`
+
+Xe subclasses `ttm_tt` (`:374`):
+
+```c
+struct xe_ttm_tt {
+	struct ttm_tt ttm;
+	struct sg_table sgt;
+	struct sg_table *sg;
+	bool purgeable;
+};
+```
+
+### The CCS extra pages
+
+```c
+extra_pages = 0;
+if (xe_bo_needs_ccs_pages(bo))
+	extra_pages = DIV_ROUND_UP(xe_device_ccs_bytes(xe, xe_bo_size(bo)), PAGE_SIZE);
+```
+
+Flat CCS is hardware memory compression: alongside a compressed surface the
+GPU keeps **compression metadata** in a separate region of VRAM. When such a
+buffer is evicted to system memory, that metadata has to go somewhere — so the
+page list is allocated *larger than the buffer*, with the tail holding the CCS
+bytes. `xe_bo_needs_ccs_pages()` at `:3929` is the eligibility ladder
+(Xe2 discrete handles it in hardware; needs flat CCS; device-type only; not
+if compression was disabled).
+
+### The caching decision tree
+
+```c
+enum ttm_caching caching = ttm_cached;
+
+if (!IS_DGFX(xe)) {                       /* integrated only */
+	switch (bo->cpu_caching) {
+	case DRM_XE_GEM_CPU_CACHING_WC: caching = ttm_write_combined; break;
+	default:                        caching = ttm_cached;         break;
+	}
+
+	if ((!bo->cpu_caching && bo->flags & XE_BO_FLAG_FORCE_WC) ||
+	    (!xe->info.has_cached_pt && bo->flags & XE_BO_FLAG_PAGETABLE))
+		caching = ttm_write_combined;
+}
+
+if (bo->flags & XE_BO_FLAG_NEEDS_UC)
+	caching = ttm_uncached;
+```
+
+The whole `if (!IS_DGFX(xe))` guard is Beat A's hardware fact in code — its
+comment says it outright: *"DGFX system memory is always WB / ttm_cached …
+GPU system memory accesses are always coherent with the CPU."* On discrete,
+there is no decision to make.
+
+The `has_cached_pt` clause is a nice concrete example: on some generations the
+GPU's own **page-table walker** isn't coherent with CPU caches, so page-table
+buffers must be write-combined or the GPU would read stale PTEs. Chapter 7
+will build those page tables; this is where their memory gets its cache mode.
+
+### `xe_ttm_tt_populate()` — `:550`
+
+```c
+if ((tt->page_flags & TTM_TT_FLAG_EXTERNAL) &&
+    !(tt->page_flags & TTM_TT_FLAG_EXTERNAL_MAPPABLE))
+	return 0;                                  /* dma-buf: not ours   */
+
+if (ttm_tt_is_backed_up(tt) && !xe_tt->purgeable)
+	err = ttm_tt_restore(ttm_dev, tt, ctx);    /* swapped out: read back */
+else
+	err = ttm_pool_alloc(&ttm_dev->pool, tt, ctx);   /* the pallet depot */
+```
+
+Three cases, one `if`-ladder: *somebody else's pages*, *our pages that were
+swapped out*, *fresh pages from the pool*. `ttm_pool_alloc()` is the Beat A
+pool — `ttm/ttm_pool.c`, 1564 lines of order-and-caching-bucketed recycling.
+
+`unpopulate()` at `:580` is the mirror: unmap the scatter-gather table, then
+`ttm_pool_free()` — back to the depot, not to the kernel.
+
+## 7. How a crate dies
+
+```
+last handle closed / last reference dropped
+  └─ drm_gem_object_put()  -> refcount hits 0
+     └─ xe_gem_object_free()              :1882
+        └─ ttm_bo_fini()                          TTM teardown, may defer
+           └─ xe_ttm_bo_destroy()         :1844   the driver's last word
+```
+
+`xe_ttm_bo_destroy()` reads like a checklist of everything this buffer joined:
+
+```c
+drm_gem_object_release(&bo->ttm.base);
+xe_assert(xe, list_empty(&ttm_bo->base.gpuva.list));   /* no mappings left! */
+
+for_each_tile(tile, xe, id)
+	if (bo->ggtt_node[id])
+		xe_ggtt_remove_bo(tile->mem.ggtt, bo);
+
+if (bo->vm && xe_bo_is_user(bo))
+	xe_vm_put(bo->vm);
+...
+kfree(bo);
+```
+
+That `xe_assert` on `gpuva.list` is the guardrail for the next chapters: a
+buffer must not still be mapped into any VM when it dies. Chapter 6 is about
+that list.
+
+Note also `ttm_bo_fini()` may **defer** the free (`delayed_delete` in
+`ttm_buffer_object`) if fences are still outstanding — you cannot free memory
+the GPU is mid-way through writing. The clipboard again.
+
+## Try it yourself
+
+```bash
+# the three layers, one after another
+sed -n '/^struct xe_bo {/,/^};/p'              drivers/gpu/drm/xe/xe_bo_types.h
+sed -n '/^struct ttm_buffer_object {/,/^};/p'  include/drm/ttm/ttm_bo.h
+sed -n '/^struct ttm_tt {/,/^};/p'             include/drm/ttm/ttm_tt.h
+
+# how pervasive the retry pattern is
+git grep -c 'xe_validation_guard\|drm_exec_retry_on_contention' drivers/gpu/drm/xe | sort -t: -k2 -rn | head
+```
+
+## Checkpoint
+
+1. Why does a BO created against a VM use `xe_vm_resv(vm)` rather than its own
+   reservation object? What does that buy at submission time?
+2. `xe_bo_init_locked()` blocks on `DMA_RESV_USAGE_KERNEL` fences for kernel
+   BOs but not user BOs. Why is that not a correctness bug for user BOs?
+3. A buffer with flat-CCS compression is evicted from VRAM to system memory.
+   Why is its `ttm_tt` bigger than the buffer?
+4. What are the two recoverable failures `xe_validation_guard()` retries, and
+   how do they differ?
+
+<details>
+<summary>answers</summary>
+
+1. All the VM's private buffers then share one lock. Submitting work that
+   touches thousands of buffers takes one reservation lock instead of
+   thousands, and `ctx.resv` tells TTM not to try re-taking it during eviction.
+2. Because user BOs are only ever reached through the submission path, which
+   already waits on the fences in each buffer's `dma_resv` before the job runs.
+   Kernel BOs are typically written by the CPU immediately after creation, with
+   no such dependency step.
+3. The hardware keeps compression metadata separate from the surface. Evicting
+   to system memory must preserve it, so `extra_pages` worth of CCS data is
+   appended to the page list.
+4. Lock contention (ww_mutex wound — unwind all locks and retry the whole
+   transaction) and OOM (retry under device-wide exhaustive eviction). The
+   first is a race against another thread; the second is genuine memory
+   pressure.
+
+</details>
