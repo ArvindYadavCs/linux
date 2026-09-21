@@ -55,3 +55,4 @@ We never move to the next chapter until both beats of the current one land.
 
 * [01 — The Cast](01-the-cast.md) — story + code
 * [02 — Where Memory Lives](02-where-memory-lives.md) — story + code
+* [03 — The Crate](03-the-crate.md) — story
