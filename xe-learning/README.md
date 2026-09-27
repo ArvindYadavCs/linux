@@ -58,3 +58,4 @@ We never move to the next chapter until both beats of the current one land.
 * [03 — The Crate](03-the-crate.md) — story + code
 * [04 — Moving Things Around](04-the-warehouse-manager.md) — story + code
 * [05 — Two Address Spaces](05-two-address-spaces.md) — story + code
+* [06 — The VM and the VMA](06-the-vm-and-the-vma.md) — story + code
