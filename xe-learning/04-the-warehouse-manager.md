@@ -1,668 +1,394 @@
-# Chapter 4 — The Warehouse Manager at Work
+# Chapter 4 — Moving Things Around
 
-> Beat A: the story.
+> Beat A: the story. (Beat B, the code, follows.)
 
 We have warehouses (Chapter 2) and crates (Chapter 3). Nothing has moved yet.
+This chapter is about movement.
 
-This chapter is the machinery of movement: how a buffer gets to where it needs
-to be, who gets thrown out to make room, who physically carries the bytes, and
-who has to be told afterwards.
-
-It is the busiest chapter in Act I. Everything here is TTM asking Xe questions
-and Xe answering.
+Only four ideas. Take them one at a time.
 
 ---
 
-## 1. Validate: make reality match the wish
+## Idea 1: "Validate" means *put it where it needs to be*
 
-A buffer is about to be used. Somebody — a submission, a CPU mapping, a bind —
-needs it to actually be *somewhere usable*. So they **validate** it.
+Somebody is about to use a buffer. Before they can, the buffer must actually be
+somewhere usable. The act of making that true is called **validate**.
 
-Validation is one question asked well:
+Validate asks one question:
 
-> *Is this buffer's current location compatible with its wish list? If not,
-> make it so.*
+> *Is this buffer already in a place its wish list allows?*
 
-Three outcomes:
+* **Yes** → do nothing. Done. (This is what happens almost every time.)
+* **No** → find space somewhere on the wish list, and move the bytes there.
 
-* **Already fine.** The buffer's resource satisfies one of the placement
-  entries. Nothing happens. This is the overwhelmingly common case, and it's
-  cheap — a comparison, no allocation.
-* **Needs moving.** Ask a resource manager for space in an acceptable memory
-  type, then move the bytes there.
-* **No space anywhere.** Start evicting other buffers, then try again.
-
-The crucial thing about validate is that it is **idempotent and repeated**.
-Every submission validates every buffer it touches, every time. The fast path
-being a single compatibility check is what makes that affordable.
+That's it. Validate is called constantly — every submission validates every
+buffer it touches — so the "yes, already fine" path is deliberately just one
+comparison.
 
 ---
 
-## 2. The two-pass trick
+## Idea 2: To make room, kick out the oldest crate
 
-Here's a subtlety that explains a flag we met in Chapter 2 and never fully
-used.
+What if there is no space?
 
-Suppose a buffer's wish list is *"VRAM0 preferred, system memory as
-fallback"*, and VRAM is full.
+The clerk does **not** immediately give up and use the fallback warehouse.
+Instead it looks inside the *good* warehouse and asks: *who in here hasn't been
+used lately?* That crate gets moved out, and the new one takes its place.
 
-The naive approach walks the list, fails on VRAM, succeeds on system memory,
-and you end up in system memory forever. VRAM would never be used once full —
-which is to say, almost immediately, and then permanently.
+This is **eviction**. Victims are chosen oldest-first (an LRU list).
 
-So TTM walks the list **twice**:
+Only if there is genuinely nobody worth evicting does the new crate settle for
+the fallback warehouse.
 
-* **First pass:** consider only *desired* entries — skip anything marked
-  `FALLBACK`. If space isn't free, **evict somebody** to make it free.
-* **Second pass:** now consider the fallback entries. Take the consolation
-  prize.
+So placement really happens in two rounds:
 
-That's what `TTM_PL_FLAG_FALLBACK` was for. It doesn't mean "lower priority";
-it means **"don't even look at me until you have genuinely tried to evict for
-the good option."**
+| Round | What it will accept |
+|-------|--------------------|
+| 1 | only the **preferred** spot — evicting somebody if needed |
+| 2 | the **fallback** spot |
 
-The story version: the clerk doesn't say "warehouse full, use the annex." The
-clerk says "warehouse full — who in there hasn't been touched lately? Move
-*them* to the annex, and put the new crate in the good spot." Only if there is
-genuinely nobody worth moving does the new crate go to the annex.
+Without round 1, VRAM would stop being used the first time it filled up — and
+then forever. That's why the order matters.
 
----
-
-## 3. Eviction: who gets thrown out
-
-To evict, TTM needs a victim. It walks the memory type's **LRU list** —
-least-recently-used first — and for each candidate asks two questions:
-
-**Can I lock it?** Eviction needs the victim's `dma_resv`. If another thread
-holds it, skip (or wound it, if we're in a ww-mutex transaction).
-
-**Is evicting it valuable?** This is a driver callback, and it's a veto. TTM
-asks: *"would moving this buffer out actually help me satisfy the placement I
-want?"* A buffer sitting outside the address range we need doesn't help, so
-evicting it would be pointless work.
-
-Xe adds a second, subtler veto — and it's worth understanding because it
-prevents a genuine disaster:
-
-> **Never evict a buffer belonging to a VM that is currently validating.**
-
-Picture it. A submission is validating 500 buffers belonging to VM A. Buffer
-#400 doesn't fit, so TTM goes looking for a victim — and picks buffer #7,
-which this very submission already validated and still needs. The submission
-would evict its own working set, one buffer at a time, forever making no
-progress. Xe's veto breaks that loop.
-
-Once a victim is chosen, its own placement is consulted through another driver
-callback: *"where should this evicted buffer go?"* Xe's answer is a small
-table:
-
-* evicted from **VRAM or stolen** → go to **TT** (GPU-reachable system memory)
-* evicted from **TT** → go to **SYSTEM** (the parking yard; this is swapout)
-
-And two special answers:
-
-* a buffer userspace marked **"don't need"** → don't move it, **throw the
-  contents away**
-* the device has been **unplugged** → same, purge everything; there is no
-  hardware left to preserve data for
-
-That last pair is the interesting design point: **a placement list with zero
-entries means "discard the backing store entirely."** Eviction and destruction
-are the same mechanism with a different wish list.
+**One special rule from Xe:** never evict a buffer belonging to a VM that is
+*currently* validating. Otherwise a submission validating 500 buffers could
+evict buffers it already validated and still needs — forever making no
+progress.
 
 ---
 
-## 4. Who carries the crate
+## Idea 3: The GPU copies its own memory
 
-Now the physical move. And the answer is the thing people find surprising:
+Now the actual move. Who carries the bytes?
 
-> **The GPU copies its own memory.**
+**The GPU does.** Not `memcpy`. Xe builds a tiny program of copy commands and
+submits it to the **blitter** (the copy engine from Chapter 1).
 
-Not `memcpy`. Not DMA engines in the chipset. Xe builds a small batch buffer of
-copy commands, submits it to the **blitter engine** (the copy engine from
-Chapter 1), and the GPU does the work.
+Why? The GPU has huge bandwidth to VRAM. The CPU reaching into VRAM through
+that small BAR window would crawl — and might not even be able to see the
+memory at all.
 
-Why? Because it's dramatically faster — the GPU has the bandwidth to VRAM, and
-the CPU reaching into VRAM through the BAR window would be crawling. Also the
-CPU may not even be able to *see* the VRAM in question (Chapter 2's window
-problem).
+This has one big consequence:
 
-This has a huge consequence:
+> **A move returns a fence, not finished bytes.**
 
-> **A migration returns a fence, not a finished copy.**
+The copy is submitted and the function returns immediately. The bytes are still
+in flight. The copy's fence goes onto the buffer's clipboard (the `dma_resv`
+from Chapter 3), and anybody who touches the buffer later waits on it.
 
-The move callback submits the copy and returns immediately. The bytes are still
-in flight. TTM attaches the copy's fence to the buffer's `dma_resv` under
-`DMA_RESV_USAGE_KERNEL` — the clipboard from Chapter 3 — and lets everyone
-carry on. Anybody who later touches the buffer waits on that fence.
+So eviction under memory pressure doesn't freeze the machine. It queues copies.
 
-That's Chapter 3's *"return early, record a fence"* pattern doing real work.
-Eviction under memory pressure doesn't stall the world; it queues copies.
+### And a nice consequence of that
 
-### Clear instead of copy
+Remember from Chapter 2:
 
-One optimization worth its own name. Before copying, Xe asks: *does the source
-actually contain anything meaningful?*
+* `XE_PL_SYSTEM` = system RAM the GPU **cannot** reach
+* `XE_PL_TT` = system RAM the GPU **can** reach
 
-Sometimes it doesn't — a brand-new buffer, or one whose pages were never
-populated. There's nothing to preserve. In that case the GPU doesn't copy, it
-just **clears** the destination — which it must do anyway, so another process's
-data can't leak through recycled memory.
+If the GPU does the copying, then the GPU **cannot** copy VRAM → `XE_PL_SYSTEM`.
+It cannot address the destination!
 
-So the move callback really has three modes: *nothing to do* (just swap the
-resource pointer), *clear the destination*, and *copy source to destination*.
-
----
-
-## 5. You can't get there from here
-
-Now a constraint that falls straight out of Chapter 2, and it's the most
-satisfying "aha" in Act I.
-
-Remember: `XE_PL_SYSTEM` is system memory the GPU **cannot reach**.
-`XE_PL_TT` is system memory the GPU **can** reach.
-
-And we just established that **the GPU does the copying.**
-
-Therefore: the GPU cannot copy a buffer from VRAM to `XE_PL_SYSTEM`. It cannot
-address the destination. Nor from `XE_PL_SYSTEM` to VRAM — it can't address the
-source.
-
-So those moves are **impossible in one step**. The driver's answer is to tell
-TTM: *"I can't do this directly — bounce through `XE_PL_TT` first."* TTM
-performs the move in two hops:
+So that move happens in two steps:
 
 ```
-   VRAM  --[GPU copies]-->  XE_PL_TT  --[just relabel]-->  XE_PL_SYSTEM
+  VRAM  --[GPU copies]-->  XE_PL_TT  --[just relabel, 0 bytes]-->  XE_PL_SYSTEM
 ```
 
-The second hop moves no data at all. The pages are the same pages; they simply
-stop being DMA-mapped for the device. It's a change of *status*, not of
-location — exactly what Chapter 2 said the SYSTEM/TT distinction was.
-
-The mechanism is a special return code meaning "multi-hop", plus a temporary
-intermediate placement. When you see it in code, read it as: **"the copy engine
-can't see one end of this move."**
+The second step moves no data. Same pages — they just stop being DMA-mapped for
+the device. Exactly what Chapter 2 said the SYSTEM/TT difference was.
 
 ---
 
-## 6. Telling everyone the map is stale
-
-The last piece, and the one that reaches out of memory management into the rest
-of the driver.
+## Idea 4: Moving a buffer breaks every map of it
 
 A buffer's bytes just moved. Anybody holding a **GPU address** for it now holds
-a lie. Page tables say "virtual address X maps to VRAM page Y"; the data is no
-longer at VRAM page Y.
+a wrong address. Page tables still say "virtual address X lives at VRAM page
+Y", but the data left.
 
-So *before* the move happens, the driver is given a chance to react. This is
-the notify callback, and Xe uses it to do three things:
+So *before* the move, the driver walks every VM that has this buffer mapped and
+deals with it. Two different strategies:
 
-1. **Tear down CPU mappings.** Any kernel vmap of the buffer is now invalid.
-2. **Walk every VM that has this buffer mapped** and mark those mappings as
-   needing a rebind. A buffer can be mapped into many VMs at many addresses;
-   all of them must be told.
-3. **Wait, or arrange to wait, for GPU work using those mappings to finish.**
-   You cannot pull the rug out from under a job that is mid-execution.
+* **Normal VM** → just *mark* the mappings as stale. They get rebuilt before
+  that VM's next submission.
+* **Fault-mode VM** → wipe the page table entries right now. They'll be rebuilt
+  automatically by page faults when next touched.
 
-Point 2 is where two worlds meet. Every buffer keeps a list of the mappings
-that reference it — the list whose emptiness Chapter 3's destructor asserted.
-Migration walks that list and invalidates each one.
-
-And there's a fork in the road here that previews a lot of later material:
-
-* A VM in **normal mode** must be told to re-bind its mappings before its next
-  submission. The driver marks them and the work happens later.
-* A VM in **fault mode** doesn't need telling. Its mappings are established on
-  demand by page faults, so an invalidated mapping simply faults again next
-  time it's touched.
-
-Same event, two completely different recovery strategies. Chapters 10 and 18.
+This is the hinge between memory management and the rest of the driver, and we
+come back to it in Chapters 10 and 18.
 
 ---
 
-## 7. The LRU, and why it's moved in bulk
+## Two more things, briefly
 
-Eviction picks victims by LRU order, so something must maintain that order.
-Every resource sits on its memory type's LRU list, and using a buffer moves it
-to the tail.
+**Bulk LRU.** A submission may touch 5000 buffers. Moving 5000 LRU entries one
+by one would be absurd, so buffers belonging to one VM are grouped and moved as
+a unit. Same trick as the shared lock in Chapter 3: *make the VM the unit, not
+the buffer.*
 
-But consider a submission touching 5000 buffers in one VM. Moving 5000 entries
-to the tail of a list, one at a time, under a lock, on every submission, is
-absurd.
-
-So TTM supports **bulk moves**: a group of resources that are guaranteed to
-stay adjacent on the LRU and can be moved to the tail as a unit, in constant
-time. Xe gives every VM one of these, and every user buffer created against
-that VM joins it.
-
-This is the same trick as the shared reservation object from Chapter 3, applied
-to a different data structure: **make the VM the unit of accounting, not the
-buffer.** It's why Xe's submission path is cheap.
-
-There is also a small **priority** dimension — a handful of priority levels, so
-some buffers are considered for eviction before others regardless of age.
+**Purging.** Userspace can say "I don't need these contents any more, just keep
+the object". Under pressure, Xe throws the contents away instead of paying to
+copy them. The cheapest move is the one where you discard the cargo.
 
 ---
 
-## 8. Shrinking and purging
-
-Two more pressure valves, both driven from outside the GPU.
-
-**The shrinker.** Xe registers with the kernel's memory shrinker, so when the
-*system* is short on memory — not the GPU — the kernel can ask Xe to give
-pages back. Xe responds by swapping buffer contents out to backup storage and
-freeing the pages, or by purging buffers whose contents nobody wants.
-
-**Purgeable buffers.** Userspace can mark a buffer *"I don't need the contents
-any more, but keep the object around"* — a cache it can regenerate, typically.
-Under pressure, Xe simply throws the contents away rather than paying to
-preserve them. This is what the `MADVISE` ioctl from Chapter 1's table is for.
-
-The interaction with eviction is neat: a *don't-need* buffer being evicted
-doesn't get copied anywhere. It gets purged. The cheapest possible migration is
-the one where you discard the cargo.
-
----
-
-## 9. The whole conversation
-
-Step back and look at the shape of this chapter. TTM is a state machine that
-does not know what a GPU is. Everything hardware-specific arrives through a
-table of callbacks the driver fills in. Roughly:
-
-| TTM asks | Xe answers |
-|----------|-----------|
-| create/populate/free a page list | pool allocation, caching, CCS pages (ch 3) |
-| where should this evicted buffer go? | VRAM→TT, TT→SYSTEM, don't-need→purge |
-| is evicting this one worthwhile? | not if its VM is mid-validation |
-| move these bytes | submit a blit; here's a fence |
-| the buffer is about to move | invalidate mappings, trigger rebind |
-| how does the CPU map this memory? | BAR offsets for VRAM, pages for TT |
-| the buffer is being destroyed | unmap from GGTT, drop VM reference |
-
-**That table *is* the driver's memory management.** Everything else in Act I is
-either building the inputs to it (Chapters 2–3) or dealing with its
-consequences (Chapters 5–11).
-
----
-
-## The picture
+## The whole chapter in one picture
 
 ```
-  somebody needs a buffer usable
-            |
-            v
-    +-----------------+   compatible?  ---> yes ---> done (fast path)
-    |  validate       |
-    +-----------------+
-            | no
-            v
-   pass 1: desired placements only, evict if needed
-            |
-            +--- no luck ---> pass 2: fallback placements accepted
-            |
-            v
-   +---------------------+      +-------------------------------+
-   | resource manager    |      | eviction: walk LRU, ask the   |
-   | allocates space     |<-----| driver "worth it?", move the  |
-   +---------------------+      | victim out (recursively)      |
-            |                   +-------------------------------+
-            v
-   +--------------------------------------------+
-   | notify: invalidate mappings, mark rebind   |
-   +--------------------------------------------+
-            |
-            v
-   +--------------------------------------------+
-   | move: submit a GPU blit, get a fence       |
-   |   VRAM <-> SYSTEM ? bounce through TT      |
-   +--------------------------------------------+
-            |
-            v
-   fence lands on the dma_resv; everyone else waits on it
+   somebody needs a buffer usable
+              |
+              v
+     already in an allowed place?  --- yes ---> DONE
+              | no
+              v
+     round 1: try the preferred spot
+              |
+        no room?  ---> evict the oldest crate there, then retry
+              |
+        still nothing?  ---> round 2: accept the fallback spot
+              |
+              v
+     tell every VM "your map is stale"
+              |
+              v
+     submit a GPU copy  --->  get a fence  --->  return immediately
+              |
+              v
+     fence goes on the clipboard; everyone else waits on it
 ```
 
-## Three sentences to remember
+## Remember these three
 
-1. **Validate means "make reality match the wish list"** — and the common case
-   is that it already does.
-2. **The GPU copies its own memory**, so migration is asynchronous and returns
-   a fence — and VRAM↔SYSTEM needs a TT hop because the copy engine can't
-   address `XE_PL_SYSTEM`.
-3. **Moving a buffer invalidates every mapping of it**, and that is the hinge
-   between memory management and everything else.
+1. **Validate = make reality match the wish list.** Usually it already does.
+2. **The GPU copies its own memory**, so moves are asynchronous and return a
+   fence — and VRAM↔SYSTEM needs a stop at TT along the way.
+3. **Moving a buffer invalidates every mapping of it.**
 
 ---
-
-## Checkpoint
-
-1. A buffer's wish list is "VRAM0 desired, TT fallback". VRAM0 is full but
-   contains several idle buffers. What happens, and in what order?
-2. Why can't the driver move a buffer directly from VRAM to `XE_PL_SYSTEM`?
-3. Why does Xe refuse to evict buffers belonging to a VM that is currently
-   validating?
-4. Eviction under memory pressure doesn't block the caller until the bytes have
-   moved. What makes that safe?
-
-<details>
-<summary>answers</summary>
-
-1. Pass one considers only VRAM0. It's full, so TTM walks VRAM0's LRU, picks
-   the least recently used evictable buffer, asks the driver where it should go
-   (TT), moves it, and retries the allocation — repeating until there's room.
-   The fallback TT entry is never reached. The new buffer lands in VRAM0.
-2. Because the GPU's copy engine performs the move, and `XE_PL_SYSTEM` pages
-   are by definition not DMA-mapped for the device — the GPU cannot address the
-   destination. The move goes VRAM→TT (real copy) then TT→SYSTEM (unmap only).
-3. Otherwise a submission validating a large working set could evict buffers it
-   has already validated and still needs, livelocking against itself.
-4. The copy is a GPU job whose fence is attached to the buffer's `dma_resv`
-   under `DMA_RESV_USAGE_KERNEL`. Any later access — CPU or GPU — waits on the
-   fences already on the clipboard, so nobody can observe the buffer mid-copy.
-
-</details>
-
 ---
 
 # Chapter 4 — Beat B: The Code
 
-Paths are `drivers/gpu/drm/xe/` unless stated. Line numbers are **v7.3-rc1**.
-Note two functions in this chapter share line 962 in different files — watch
-the filename.
+We follow **one single journey**, start to finish:
 
-## 1. The conversation, as a table — `xe_bo.c:1828`
+> *A buffer needs to be in VRAM. VRAM is full. Something has to move.*
 
-```c
-const struct ttm_device_funcs xe_ttm_funcs = {
-	.ttm_tt_create     = xe_ttm_tt_create,        /* ch 3 */
-	.ttm_tt_populate   = xe_ttm_tt_populate,      /* ch 3 */
-	.ttm_tt_unpopulate = xe_ttm_tt_unpopulate,    /* ch 3 */
-	.ttm_tt_destroy    = xe_ttm_tt_destroy,       /* ch 3 */
-	.evict_flags       = xe_evict_flags,          /* :315  "where should it go?" */
-	.move              = xe_bo_move,              /* :962  "move these bytes"   */
-	.io_mem_reserve    = xe_ttm_io_mem_reserve,   /* "how does the CPU map it?" */
-	.io_mem_pfn        = xe_ttm_io_mem_pfn,
-	.access_memory     = xe_ttm_access_memory,    /* ptrace / coredump reads    */
-	.release_notify    = xe_ttm_bo_release_notify,
-	.eviction_valuable = xe_bo_eviction_valuable, /* :1241 the veto             */
-	.delete_mem_notify = xe_ttm_bo_delete_mem_notify,
-	.swap_notify       = xe_ttm_bo_swap_notify,
-};
-```
+Eight steps, in order. Each code block is commented line by line.
+(Comments marked `//` are mine, explaining the code. Comments with `/* */` are
+the kernel's own.)
 
-Thirteen entries. **This is the entire interface between TTM and Xe's memory
-management.** Beat A's table, verbatim.
+Files: `drivers/gpu/drm/xe/` for Xe, `drivers/gpu/drm/ttm/` for TTM.
+Line numbers are v7.3-rc1.
 
-## 2. The canned placements — `xe_bo.c:52`
+---
 
-Three pre-built wish lists Xe hands back from `evict_flags`:
+## Step 1 — Somebody asks: `xe_bo_validate()`
 
-```c
-static const struct ttm_place sys_placement_flags = {
-	.mem_type = XE_PL_SYSTEM, .flags = 0,
-};
-static struct ttm_placement sys_placement = {
-	.num_placement = 1, .placement = &sys_placement_flags,
-};
+**File: `xe_bo.c:3302`**
 
-static struct ttm_placement purge_placement;            /* :64  <-- !!! */
-
-static const struct ttm_place tt_placement_flags[] = {
-	{ .mem_type = XE_PL_TT,     .flags = TTM_PL_FLAG_DESIRED  },
-	{ .mem_type = XE_PL_SYSTEM, .flags = TTM_PL_FLAG_FALLBACK },
-};
-static struct ttm_placement tt_placement = {
-	.num_placement = 2, .placement = tt_placement_flags,
-};
-```
-
-Look at line 64. **`purge_placement` is a bare, zero-initialized
-`ttm_placement`** — `num_placement == 0`. That is the whole implementation of
-"throw the contents away." Beat A's claim that *a zero-entry wish list means
-discard the backing store* is literally one uninitialized static variable.
-
-And `tt_placement` shows the two-pass flags in their natural habitat: try TT
-(desired, evict for it if necessary), settle for SYSTEM (fallback) only after
-that fails.
-
-## 3. `xe_bo_validate()` — `xe_bo.c:3302`
+This is the front door. Everybody who needs a buffer usable calls this.
 
 ```c
 int xe_bo_validate(struct xe_bo *bo, struct xe_vm *vm, bool allow_res_evict,
 		   struct drm_exec *exec)
 {
 	struct ttm_operation_ctx ctx = {
-		.interruptible = true,
-		.no_wait_gpu = false,
-		.gfp_retry_mayfail = true,
+		.interruptible = true,      // a stuck wait can be Ctrl-C'd
+		.no_wait_gpu = false,       // we're allowed to wait for the GPU
+		.gfp_retry_mayfail = true,  // if RAM runs out, FAIL - don't invoke
+					    // the OOM killer to shoot processes
 	};
+	int ret;
 
 	if (xe_bo_is_pinned(bo))
-		return 0;                       /* pinned: already where it must be */
+		return 0;                   // pinned = cannot move = nothing to do.
+					    // Fastest possible exit.
 
 	if (vm) {
-		lockdep_assert_held(&vm->lock);
-		xe_vm_assert_held(vm);
-		ctx.allow_res_evict = allow_res_evict;
-		ctx.resv = xe_vm_resv(vm);      /* ch 3: the shared lock */
+		ctx.resv = xe_vm_resv(vm);  // "I already hold this VM's lock.
+					    //  Don't try to take it again, and
+					    //  don't evict buffers sharing it."
+					    // (Chapter 3's shared lock)
 	}
 
-	xe_vm_set_validating(vm, allow_res_evict);     /* <-- arms the veto */
-	trace_xe_bo_validate(bo);
+	xe_vm_set_validating(vm, allow_res_evict);   // raise a flag: "this VM is
+						     //  validating right now"
+						     // Step 4 reads this flag.
+
 	ret = ttm_bo_validate(&bo->ttm, &bo->placement, &ctx);
-	xe_vm_clear_validating(vm, allow_res_evict);
+	//                               ^^^^^^^^^^^^^^
+	//    The wish list we built in Chapter 2. Hand it to TTM and let TTM
+	//    do the work. Everything from here to Step 5 happens inside TTM.
+
+	xe_vm_clear_validating(vm, allow_res_evict); // lower the flag
 
 	return ret;
 }
 ```
 
-Small function, four things worth naming:
+**Takeaway:** Xe's own part is tiny. It sets up options, raises a flag, and
+hands the wish list to TTM.
 
-* **`xe_bo_is_pinned()` → return 0 immediately.** A pinned buffer cannot move,
-  so validation is a no-op. Cheapest possible fast path.
-* **`ctx.resv = xe_vm_resv(vm)`** — Chapter 3's shared reservation object again.
-  It tells TTM "I hold this lock; don't evict things that share it."
-* **`gfp_retry_mayfail = true`** — allocate without triggering the OOM killer.
-  GPU memory pressure should fail gracefully and let the caller retry (that's
-  `xe_validation_retry_on_oom` from Chapter 3), not shoot processes.
-* **`xe_vm_set_validating()` / `clear_validating()`** — this arms and disarms
-  the self-eviction veto. Remember the pair; §6 is where it fires.
+---
 
-## 4. TTM's loop — `ttm/ttm_bo.c:1074`
+## Step 2 — TTM checks the easy case
+
+**File: `ttm/ttm_bo.c:1074`** — we are now inside TTM.
 
 ```c
 int ttm_bo_validate(struct ttm_buffer_object *bo,
-		    struct ttm_placement *placement,
+		    struct ttm_placement *placement,     // the wish list
 		    struct ttm_operation_ctx *ctx)
 {
-	dma_resv_assert_held(bo->base.resv);
+	if (!placement->num_placement)               // an EMPTY wish list means
+		return ttm_bo_pipeline_gutting(bo);  // "throw the contents away"
+						     // (used for purging)
 
-	if (!placement->num_placement)
-		return ttm_bo_pipeline_gutting(bo);      /* purge_placement lands here */
-
-	force_space = false;
+	force_space = false;                         // start with ROUND 1
 	do {
-		if (bo->resource &&
-		    ttm_resource_compatible(bo->resource, placement, force_space))
-			return 0;                            /* THE FAST PATH */
+		if (bo->resource &&                          // do we have a spot, and
+		    ttm_resource_compatible(bo->resource,    // is it one the wish
+					    placement,       // list allows?
+					    force_space))
+			return 0;                            // YES -> done, no work.
+							     // <<< THE COMMON CASE
+```
 
+That `return 0` is the whole point of Idea 1. One comparison, no allocation.
+
+Our buffer isn't in VRAM though, so we keep going:
+
+```c
 		if (bo->pin_count)
-			return -EINVAL;
+			return -EINVAL;              // pinned buffers must never move
 
+		// Ask for space. This is where rounds 1 and 2 happen (Step 3).
 		ret = ttm_bo_alloc_resource(bo, placement, ctx, force_space, &res);
-		force_space = !force_space;              /* <-- the two-pass flip */
+
+		force_space = !force_space;          // flip false->true, so the NEXT
+						     // loop iteration is ROUND 2
+
 		if (ret == -ENOSPC)
-			continue;
+			continue;                    // round 1 found nothing ->
+						     // loop again, now as round 2
 		if (ret)
-			return ret;
+			return ret;                  // a real error
 
 bounce:
+		// We have space. Now actually move the bytes (Steps 5-7).
 		ret = ttm_bo_handle_move_mem(bo, res, false, ctx, &hop);
-		if (ret == -EMULTIHOP) {
+
+		if (ret == -EMULTIHOP) {             // the driver said "I can't do
+						     //  this in one step"
 			ret = ttm_bo_bounce_temp_buffer(bo, ctx, &hop);
 			if (!ret)
-				goto bounce;                 /* <-- the second hop */
+				goto bounce;         // move to the halfway stop,
+						     // then try the final leg again
 		}
 		...
-	} while (ret && force_space);
+	} while (ret && force_space);                 // loop runs at most twice
 }
 ```
 
-Every one of Beat A's claims is visible here:
+**Takeaway:** one `do/while` loop that runs at most twice — round 1, then round
+2. `force_space` is just the round number as a bool. The `goto bounce` is the
+two-step move from Idea 3.
 
-* **`!placement->num_placement` → gutting.** The purge path, first thing in the
-  function.
-* **`ttm_resource_compatible()` → return 0.** The fast path — one comparison,
-  no allocation. This is what runs for almost every buffer on almost every
-  submission.
-* **`force_space = !force_space`** is the two-pass mechanism. First iteration
-  `false`, second `true`, and the `while (ret && force_space)` ends it.
-* **`goto bounce`** is the multi-hop. `ttm_bo_bounce_temp_buffer()` at `:334`
-  moves the BO to the temporary stop, then we re-enter the move for the final
-  leg.
+---
 
-## 5. The line that makes two-pass work — `ttm/ttm_bo.c:962`
+## Step 3 — Finding space: the two rounds
 
-Inside `ttm_bo_alloc_resource()`, walking the placement array:
+**File: `ttm/ttm_bo.c:962`**, inside `ttm_bo_alloc_resource()`.
+
+This walks the wish list. One line does all the round-1-vs-round-2 magic:
 
 ```c
-for (i = 0; i < placement->num_placement; ++i) {
-	const struct ttm_place *place = &placement->placement[i];
+	// Walk the wish list entries in order (VRAM first, then TT, ...)
+	for (i = 0; i < placement->num_placement; ++i) {
+		const struct ttm_place *place = &placement->placement[i];
 
-	man = ttm_manager_type(bdev, place->mem_type);
-	if (!man || !ttm_resource_manager_used(man))
-		continue;
+		man = ttm_manager_type(bdev, place->mem_type);   // the clerk for this
+								 // memory type
+		if (!man || !ttm_resource_manager_used(man))
+			continue;      // no such warehouse on this machine.
+				       // (On an integrated GPU there is no VRAM
+				       //  manager, so VRAM entries skip silently.)
 
-	if (place->flags & (force_space ? TTM_PL_FLAG_DESIRED :
-			    TTM_PL_FLAG_FALLBACK))
-		continue;                                  /* <-- THE line */
+		// ==================== THE KEY LINE ====================
+		if (place->flags & (force_space ? TTM_PL_FLAG_DESIRED
+						: TTM_PL_FLAG_FALLBACK))
+			continue;
+		// Round 1 (force_space == false): skip entries marked FALLBACK.
+		//    -> only the preferred spot is considered.
+		// Round 2 (force_space == true):  skip entries marked DESIRED.
+		//    -> only the fallback spot is considered.
+		// ======================================================
 
-	ret = ttm_bo_alloc_at_place(bo, place, force_space, res, &alloc_state);
+		ret = ttm_bo_alloc_at_place(bo, place, force_space, res, &alloc_state);
 
-	if (ret == -ENOSPC) {
-		continue;                                  /* try next placement  */
-	} else if (ret == -EBUSY) {
-		ret = ttm_bo_evict_alloc(bdev, man, place, bo, ctx,
-					 ticket, res, &alloc_state);   /* EVICT */
-		...
+		if (ret == -ENOSPC) {
+			continue;              // this warehouse is full -> try the
+					       // next wish-list entry
+		} else if (ret == -EBUSY) {
+			// Full, but there ARE crates in there we could move out.
+			// Go evict somebody. (Step 4)
+			ret = ttm_bo_evict_alloc(bdev, man, place, bo, ctx,
+						 ticket, res, &alloc_state);
+			...
+		}
+		return 0;                      // got space!
 	}
-	return 0;
-}
-return -ENOSPC;
+
+	return -ENOSPC;                        // nothing on the wish list worked
 ```
 
-Read the ternary carefully — it's the crux of the whole chapter:
+To be completely concrete, for a wish list of
+`[VRAM0 (desired), TT (fallback)]`:
 
-| pass | `force_space` | skips entries flagged | so it considers |
-|------|---------------|----------------------|-----------------|
-| 1 | `false` | `FALLBACK` | desired placements only |
-| 2 | `true` | `DESIRED` | fallback placements only |
+| | round 1 | round 2 |
+|--|---------|---------|
+| VRAM0 entry | considered — evict for it | skipped |
+| TT entry | skipped | considered |
 
-**Pass 1 refuses to look at the consolation prize. Pass 2 refuses to look at
-the good option** (it already failed). That inverted skip is how "evict before
-you settle" is implemented in one line.
+**Takeaway:** the ternary inverts which entries get skipped. That's all
+"evict before you settle" is.
 
-Also note `man || ttm_resource_manager_used(man)` → `continue`. On an
-integrated GPU there is no VRAM manager registered, so a VRAM placement entry
-is silently skipped rather than failing. Chapter 2's `IS_DGFX` asymmetry,
-handled for free.
+---
 
-### The eviction walk — `ttm/ttm_bo.c:720`
+## Step 4 — Choosing a victim
+
+**File: `ttm/ttm_bo.c:720`**, `ttm_bo_evict_alloc()`.
+
+TTM walks the LRU list (oldest first) looking for someone to move out. It does
+this **twice**, and the reason is nice:
 
 ```c
-static int ttm_bo_evict_alloc(...)
-{
-	state->in_evict = true;
-
+	// SWEEP 1: only consider victims whose lock happens to be free right now.
 	evict_walk.walk.arg.trylock_only = true;
 	lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
-	...
-	if (lret || !ticket)
-		goto out;
+	//   Cheap and never blocks. If we find an easy victim, great.
 
+	if (lret || !ticket)
+		goto out;                    // found one (or we're not allowed to
+					     // contend for locks) -> stop here
+
+	// SWEEP 2: nothing easy. Now fight for locks properly.
 	evict_walk.walk.arg.trylock_only = false;
 retry:
 	do {
-		evict_walk.walk.arg.ticket = ticket;
+		evict_walk.walk.arg.ticket = ticket;   // ww-mutex ticket: lets us
+						       // "wound" other threads and
+						       // make them retry
 		evict_walk.evicted = 0;
 		lret = ttm_lru_walk_for_evict(&evict_walk.walk, bdev, man, 1);
-	} while (!lret && evict_walk.evicted);
-	...
-}
+	} while (!lret && evict_walk.evicted);         // keep evicting until an
+						       // allocation succeeds, or
+						       // nothing is left to evict
 ```
 
-**Two sweeps, and the first is `trylock_only`.** Sweep one only considers
-victims whose lock is free right now — cheap, no risk of blocking. Only if that
-finds nothing does sweep two arm the ww-mutex `ticket` and start contending
-for locks properly.
+For each candidate, TTM asks the driver *"is evicting this one worth it?"*.
+Back in Xe:
 
-That is Beat A's "can I lock it?" question, done twice with different
-aggression. The `do { } while (evicted)` loop keeps evicting until one
-allocation attempt succeeds or nothing is left to evict.
-
-## 6. Xe's two answers
-
-### "Where should this evicted buffer go?" — `xe_bo.c:315`
-
-```c
-static void xe_evict_flags(struct ttm_buffer_object *tbo,
-			   struct ttm_placement *placement)
-{
-	bool device_unplugged = drm_dev_is_unplugged(&xe->drm);
-
-	if (!xe_bo_is_xe_bo(tbo)) {                       /* not ours */
-		if (tbo->type == ttm_bo_type_sg) {
-			placement->num_placement = 0;             /* can't move it */
-			return;
-		}
-		*placement = device_unplugged ? purge_placement : sys_placement;
-		return;
-	}
-
-	bo = ttm_to_xe_bo(tbo);
-	if (bo->flags & XE_BO_FLAG_CPU_ADDR_MIRROR) {
-		*placement = sys_placement;                   /* SVM: ch 10 */
-		return;
-	}
-
-	if (device_unplugged && !tbo->base.dma_buf) {
-		*placement = purge_placement;                 /* nothing to save */
-		return;
-	}
-
-	if (xe_bo_madv_is_dontneed(bo)) {
-		*placement = sys_placement;   /* NOT purge_placement -- see below */
-		return;
-	}
-
-	switch (tbo->resource->mem_type) {
-	case XE_PL_VRAM0:
-	case XE_PL_VRAM1:
-	case XE_PL_STOLEN:
-		*placement = tt_placement;    /* VRAM/stolen -> GPU-reachable RAM */
-		break;
-	case XE_PL_TT:
-	default:
-		*placement = sys_placement;   /* TT -> parking yard (swapout)     */
-		break;
-	}
-}
-```
-
-Beat A's answer table, one-for-one. Two subtleties the code volunteers:
-
-* **`num_placement = 0` for foreign sg BOs.** A scatter-gather buffer from
-  another device has pages Xe doesn't own — it cannot be moved *or* purged, so
-  the zero-entry list here means "refuse", not "discard". Same value, opposite
-  meaning, distinguished by context.
-* **The `dontneed` case deliberately does *not* use `purge_placement`.** The
-  comment explains it: purging via TTM's gutting path would skip
-  `xe_bo_move()`, and Xe wants its *own* purge procedure to run there. So it
-  asks for `sys_placement` and purges at the top of the move callback instead.
-  That's the `evict && dontneed` branch at `:985`.
-
-### "Is evicting this worthwhile?" — `xe_bo.c:1241`
+**File: `xe_bo.c:1241`**
 
 ```c
 static bool
@@ -671,395 +397,332 @@ xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *pl
 	struct drm_gpuvm_bo *vm_bo;
 
 	if (!ttm_bo_eviction_valuable(bo, place))
-		return false;                      /* TTM's own range check first */
+		return false;
+	// TTM's own check first: would moving this buffer actually free space in
+	// the address range we need? If not, moving it is pointless work.
 
 	if (!xe_bo_is_xe_bo(bo))
-		return true;
+		return true;                 // not our buffer, no opinion
 
+	// Xe's extra rule. Walk every VM this buffer is mapped into:
 	drm_gem_for_each_gpuvm_bo(vm_bo, &bo->base) {
 		if (xe_vm_is_validating(gpuvm_to_vm(vm_bo->vm)))
-			return false;                  /* <-- the self-eviction veto */
+			return false;
+		// ^^^ THE VETO. This VM is validating RIGHT NOW (the flag raised
+		//     back in Step 1). If we evicted this buffer, that validation
+		//     would be destroying its own working set and would never
+		//     finish. So: hands off.
 	}
 
-	return true;
+	return true;                         // safe to evict
 }
 ```
 
-**Beat A's livelock disaster, prevented in five lines.** `xe_vm_is_validating()`
-reads the flag `xe_bo_validate()` set two sections ago. The loop walks every VM
-this buffer is mapped into — because a buffer shared between VMs must not be
-evicted if *any* of them is mid-validation.
+**Takeaway:** two sweeps (easy victims, then contested ones), and one veto that
+prevents a submission from eating itself.
 
-`drm_gem_for_each_gpuvm_bo` iterates the per-buffer list of VM associations.
-That list is Chapter 6's subject; here it's used purely as "who would be
-hurt if I moved this?"
+---
 
-## 7. `xe_bo_move()` — `xe_bo.c:962`
+## Step 5 — Now move the bytes: `xe_bo_move()`
 
-~240 lines. It is a **decision ladder**, and the only way to read it is
-top-down, because every rung assumes the ones above it did not fire.
+**File: `xe_bo.c:962`** — back in Xe.
 
-### Rung 0: the state variables — `:1012`
+This function is long (~240 lines), but it is only a **list of special cases,
+checked in order**, ending in one real copy. Don't read it as 240 lines; read it
+as a checklist.
+
+First it computes two booleans that decide everything (`:1012`):
 
 ```c
-bool handle_system_ccs = (!IS_DGFX(xe) && xe_bo_needs_ccs_pages(bo) &&
-			  ttm && ttm_tt_is_populated(ttm)) ? true : false;
+	// Is there anything worth copying FROM?
+	move_lacks_source = !old_mem ||             // brand-new buffer, no old spot
+			    (!mem_type_is_vram(old_mem_type) && !tt_has_data);
+			    // ^ or: not in VRAM, and its pages were never filled
 
-tt_has_data = ttm && (ttm_tt_is_populated(ttm) || ttm_tt_is_swapped(ttm));
-
-move_lacks_source = !old_mem || (handle_system_ccs ? (!bo->ccs_cleared) :
-				 (!mem_type_is_vram(old_mem_type) && !tt_has_data));
-
-needs_clear = (ttm && ttm->page_flags & TTM_TT_FLAG_ZERO_ALLOC) ||
-	(!ttm && ttm_bo->type == ttm_bo_type_device);
+	// Must the destination be zeroed?
+	needs_clear = (ttm && ttm->page_flags & TTM_TT_FLAG_ZERO_ALLOC) ||
+		      (!ttm && ttm_bo->type == ttm_bo_type_device);
+		      // ^ a user-visible buffer with no page list: we don't know
+		      //   what's in the destination, and must not leak it
 ```
 
-Two booleans carry the whole function:
+Those two bits pick one of three behaviours:
 
-* **`move_lacks_source`** — "there is nothing meaningful to copy *from*." True
-  for a fresh BO, or one whose page list was never populated.
-* **`needs_clear`** — "the destination must be zeroed." True when TTM asked for
-  zeroed pages, or when a *user-visible* BO has no page list (so we can't know
-  what's in the destination and must not leak it).
+| `move_lacks_source` | `needs_clear` | what happens |
+|---|---|---|
+| true | false | **nothing** — just swap the resource pointer |
+| true | true | **clear** the destination |
+| false | — | **copy** source → destination |
 
-`move_lacks_source && needs_clear` → **clear**. `!move_lacks_source` →
-**copy**. `move_lacks_source && !needs_clear` → **nothing**. Beat A's three
-modes, as two bits.
-
-### The ladder
+Then the checklist. Here it is with only what matters:
 
 ```c
-:985   if (evict && xe_bo_madv_is_dontneed(bo))       -> purge, free dst, done
-:995   if ((!old_mem && ttm) && !handle_system_ccs)   -> creation path: map sg,
-                                                         ttm_bo_move_null()
-:1004  if (ttm_bo->type == ttm_bo_type_sg)            -> dma-buf path
-:1023  if (new_mem->mem_type == XE_PL_TT)             -> xe_tt_map_sg() first
-:1029  if (move_lacks_source && !needs_clear)         -> ttm_bo_move_null()
-:1031  if (CPU_ADDR_MIRROR && new == SYSTEM)          -> xe_svm_bo_evict()
-:1045  if (old == SYSTEM && new == TT)                -> ttm_bo_move_null()
-:1053  if (old == TT && new == TT)                    -> ttm_bo_move_null()
-:1060  if (!move_lacks_source && !pinned)             -> xe_bo_move_notify()
-:1066  if (old == TT && new == SYSTEM)                -> wait BOOKKEEP, then null
-:1082  if (SYSTEM <-> VRAM with real data)            -> -EMULTIHOP
-:1095  pick a migrate context
-:1132  clear or copy -> fence
-:1151  ttm_bo_move_accel_cleanup(fence)
-:1183  out: wait KERNEL if landing in SYSTEM, unmap sg
+:985   if (evict && buffer is marked "don't need")
+	       -> throw the contents away, done.          // purge
+
+:995   if (this is a brand-new buffer)
+	       -> ttm_bo_move_null()                      // 0 bytes copied
+
+:1029  if (move_lacks_source && !needs_clear)
+	       -> ttm_bo_move_null()                      // 0 bytes copied
+
+:1045  if (old == SYSTEM && new == TT)
+	       -> ttm_bo_move_null()                      // 0 bytes copied!
+	       // Same pages. They just became DMA-mapped for the device.
+
+:1060  if (there IS data here)
+	       -> xe_bo_move_notify()                     // Step 6: tell the VMs
+
+:1066  if (old == TT && new == SYSTEM)
+	       -> wait for GPU work, then ttm_bo_move_null()   // 0 bytes copied!
+	       // Same pages. They just stopped being DMA-mapped.
+
+:1082  if (SYSTEM <-> VRAM and there is real data)
+	       -> return -EMULTIHOP                       // "can't do it directly"
+
+:1132  -> submit a real GPU copy or clear                 // Step 7
 ```
 
-**`ttm_bo_move_null()` appears five times.** Every one is a "move" that copies
-zero bytes — it just swaps the resource pointer. Count them and you see how
-often migration is pure bookkeeping:
+Count the `ttm_bo_move_null()` calls: **five of them.** Five "moves" that copy
+zero bytes. Two of those are `SYSTEM ↔ TT` — exactly Idea 3's *"change of
+status, not location"*.
 
-* creating a BO into TT (`:995`)
-* nothing worth copying (`:1029`)
-* SYSTEM → TT (`:1045`) — the pages don't move; they become DMA-mapped
-* TT → TT (`:1053`) — a failed multi-hop landing back where it was
-* TT → SYSTEM (`:1066`) — the pages don't move; they stop being DMA-mapped
-
-The two SYSTEM↔TT entries are Beat A's "change of status, not location",
-appearing exactly where predicted.
-
-### The multi-hop — `:1082`
+### The two-step move, in code (`:1082`)
 
 ```c
-if (!move_lacks_source &&
-    ((old_mem_type == XE_PL_SYSTEM && resource_is_vram(new_mem)) ||
-     (mem_type_is_vram(old_mem_type) && new_mem->mem_type == XE_PL_SYSTEM))) {
-	hop->fpfn = 0;
-	hop->lpfn = 0;
-	hop->mem_type = XE_PL_TT;
-	hop->flags = TTM_PL_FLAG_TEMPORARY;
-	ret = -EMULTIHOP;
-	goto out;
-}
-```
+	if (!move_lacks_source &&                       // there IS data to copy, AND
+	    ((old_mem_type == XE_PL_SYSTEM && resource_is_vram(new_mem)) ||
+	     (mem_type_is_vram(old_mem_type) && new_mem->mem_type == XE_PL_SYSTEM))) {
+	    //  ^ we're going SYSTEM -> VRAM, or VRAM -> SYSTEM
 
-The "you can't get there from here" rule, in nine lines. Note the guard:
-**`!move_lacks_source`**. If there's nothing to copy, no copy engine is
-involved, so no hop is needed — a data-less SYSTEM↔VRAM transition is fine in
-one step. The hop exists *only* because the blitter can't address
-`XE_PL_SYSTEM`.
-
-`TTM_PL_FLAG_TEMPORARY` marks the intermediate resource so TTM knows it's a way
-station. (And the `old == TT && new == TT` rung at `:1053` exists to handle a
-multi-hop that failed partway and left the BO sitting at the way station.)
-
-### Who does the copying — `:1095`
-
-```c
-if (bo->tile)
-	migrate = bo->tile->migrate;                       /* kernel BO: its tile */
-else if (resource_is_vram(new_mem))
-	migrate = mem_type_to_migrate(xe, new_mem->mem_type);   /* dst tile */
-else if (mem_type_is_vram(old_mem_type))
-	migrate = mem_type_to_migrate(xe, old_mem_type);        /* src tile */
-else
-	migrate = xe->tiles[0].migrate;                         /* neither: tile 0 */
-```
-
-**Chapter 1's `tile->migrate` finally used.** The priority order is
-*destination tile, else source tile, else tile 0* — copy from the side that owns
-the VRAM, because that tile's blitter has local bandwidth to it.
-
-And the copy itself, `:1132`:
-
-```c
-if (move_lacks_source) {
-	u32 flags = 0;
-	if (mem_type_is_vram(new_mem->mem_type))
-		flags |= XE_MIGRATE_CLEAR_FLAG_FULL;
-	else if (handle_system_ccs)
-		flags |= XE_MIGRATE_CLEAR_FLAG_CCS_DATA;
-
-	fence = xe_migrate_clear(migrate, bo, new_mem, flags);
-} else {
-	fence = xe_migrate_copy(migrate, bo, bo, old_mem, new_mem,
-				handle_system_ccs);
-}
-```
-
-Both return **`struct dma_fence *`**. That return type *is* Beat A's headline:
-migration is asynchronous. `xe_migrate_clear()` is at `xe_migrate.c:1599`,
-`xe_migrate_copy()` at `:1095` — Chapter 7 reads them, because the same
-machinery writes page tables.
-
-Then `ttm_bo_move_accel_cleanup(ttm_bo, fence, evict, true, new_mem)` at
-`:1151` is TTM's "accelerated" (fenced) completion: it parks the old resource
-until the fence signals, installs the new one, and adds the fence to the
-`dma_resv` under KERNEL. If that fails, the fallback at `:1154` just
-`dma_fence_wait()`s synchronously — correctness over pipelining.
-
-### The exit — `:1183`
-
-```c
-out:
-	if ((!ttm_bo->resource || ttm_bo->resource->mem_type == XE_PL_SYSTEM) &&
-	    ttm_bo->ttm) {
-		long timeout = dma_resv_wait_timeout(ttm_bo->base.resv,
-						     DMA_RESV_USAGE_KERNEL, false,
-						     MAX_SCHEDULE_TIMEOUT);
-		...
-		xe_tt_unmap_sg(xe, ttm_bo->ttm);
+		hop->mem_type = XE_PL_TT;               // "stop at TT on the way"
+		hop->flags = TTM_PL_FLAG_TEMPORARY;     // "TT is just a way station"
+		ret = -EMULTIHOP;                       // tell TTM: do it in 2 steps
+		goto out;
 	}
 ```
 
-Landing in `XE_PL_SYSTEM` is the one case that **must** block. The pages are
-about to stop being DMA-mapped, so every outstanding GPU access to them has to
-be finished first — you cannot unmap memory a copy engine is still reading.
-Async everywhere else; synchronous here.
+Notice the guard `!move_lacks_source`. If there's no data to copy, no copy
+engine is involved, so no stopover is needed. **The stopover exists purely
+because the blitter cannot address `XE_PL_SYSTEM`.**
 
-## 8. Telling the VMs — `xe_bo.c:805` and `:669`
+---
+
+## Step 6 — Tell the VMs their maps are stale
+
+**File: `xe_bo.c:805`**, `xe_bo_move_notify()`.
 
 ```c
-static int xe_bo_move_notify(struct xe_bo *bo, const struct ttm_operation_ctx *ctx)
-{
 	if (xe_bo_is_pinned(bo))
-		return -EINVAL;                 /* pinned buffers do not move */
+		return -EINVAL;                  // pinned buffers never move
 
-	xe_bo_vunmap(bo);                       /* 1. kill CPU mappings   */
-	ret = xe_bo_trigger_rebind(xe, bo, ctx);/* 2. tell every VM       */
+	xe_bo_vunmap(bo);                        // 1. kill any kernel CPU mapping
+	ret = xe_bo_trigger_rebind(xe, bo, ctx); // 2. tell every VM  <-- the big one
 	if (ret)
 		return ret;
 
 	if (ttm_bo->base.dma_buf && !ttm_bo->base.import_attach)
-		dma_buf_invalidate_mappings(ttm_bo->base.dma_buf);   /* 3. importers */
-
-	if (mem_type_is_vram(old_mem_type)) {
-		/* drop it off the VRAM CPU-fault list */
-		list_del_init(&bo->vram_userfault_link);
-	}
-	return 0;
-}
+		dma_buf_invalidate_mappings(ttm_bo->base.dma_buf);
+					         // 3. tell OTHER DEVICES that
+					         //    imported this buffer
 ```
 
-Beat A's three jobs, plus a fourth: other *devices* that imported this buffer
-get told too.
-
-`xe_bo_trigger_rebind()` at `:669` is where the fault-mode fork lives:
+And `xe_bo_trigger_rebind()` at `:669` is where Idea 4's two strategies split:
 
 ```c
-drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
-	struct xe_vm *vm = gpuvm_to_vm(vm_bo->vm);
+	// Walk every VM that has this buffer mapped:
+	drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+		struct xe_vm *vm = gpuvm_to_vm(vm_bo->vm);
 
-	if (!xe_vm_in_fault_mode(vm)) {
-		drm_gpuvm_bo_evict(vm_bo, true);       /* mark: needs rebind later */
-		if (!xe_device_is_l2_flush_optimized(xe))
-			continue;                          /* <-- done for this VM   */
-	}
+		if (!xe_vm_in_fault_mode(vm)) {
+			// ---- NORMAL VM ----
+			drm_gpuvm_bo_evict(vm_bo, true);
+			// Just MARK the mappings as stale. Somebody else rebuilds
+			// them before this VM's next submission. No waiting, no
+			// page-table writes here.
+			if (!xe_device_is_l2_flush_optimized(xe))
+				continue;        // <-- done with this VM, next!
+		}
 
-	if (!idle) {
-		timeout = dma_resv_wait_timeout(bo->ttm.base.resv,
-						DMA_RESV_USAGE_BOOKKEEP,
-						ctx->interruptible,
-						MAX_SCHEDULE_TIMEOUT);
-		...
-		idle = true;
-	}
+		// ---- FAULT-MODE VM (falls through to here) ----
+		if (!idle) {
+			// Wait for GPU work that is using these mappings.
+			// You cannot pull the rug out from a running job.
+			timeout = dma_resv_wait_timeout(bo->ttm.base.resv,
+							DMA_RESV_USAGE_BOOKKEEP, ...);
+			idle = true;             // only wait once, not per VM
+		}
 
-	drm_gpuvm_bo_for_each_va(gpuva, vm_bo) {
-		struct xe_vma *vma = gpuva_to_vma(gpuva);
-		ret = xe_vm_invalidate_vma(vma);        /* zap the PTEs now */
+		// Wipe the page table entries NOW. They will be rebuilt later,
+		// automatically, by page faults. (Chapter 10)
+		drm_gpuvm_bo_for_each_va(gpuva, vm_bo) {
+			struct xe_vma *vma = gpuva_to_vma(gpuva);
+			ret = xe_vm_invalidate_vma(vma);
+		}
 	}
-}
 ```
 
-Read the `continue`. **A normal-mode VM is merely *marked* and we move on** —
-`drm_gpuvm_bo_evict()` puts its mappings on an evicted list, and the rebind
-happens before that VM's next submission (Chapter 18's rebind worker). No
-waiting, no PTE writes, right here in the eviction path.
+**Takeaway:** that `continue` is the fork. Normal VMs are marked and skipped;
+fault-mode VMs get their page tables wiped immediately.
 
-A **fault-mode** VM falls through: wait for outstanding GPU work
-(`BOOKKEEP`), then walk every mapping and invalidate its page-table entries
-immediately. Its mappings will be re-established by page faults on demand
-(Chapter 10).
+---
 
-Same event, two strategies — exactly as Beat A promised, and the `continue` is
-the branch point.
+## Step 7 — The actual copy
 
-## 9. The rest of the callbacks
-
-**`swap_notify`** — TTM is about to swap this buffer out to backup storage:
+**File: `xe_bo.c:1095`.** First, *which* copy engine?
 
 ```c
-if (xe_tt->purgeable)
-	xe_ttm_bo_purge(ttm_bo, &ctx);
+	if (bo->tile)
+		migrate = bo->tile->migrate;          // a kernel buffer: use its tile
+	else if (resource_is_vram(new_mem))
+		migrate = mem_type_to_migrate(xe, new_mem->mem_type);
+						      // going INTO VRAM: use the
+						      // destination tile's engine
+	else if (mem_type_is_vram(old_mem_type))
+		migrate = mem_type_to_migrate(xe, old_mem_type);
+						      // coming OUT of VRAM: use the
+						      // source tile's engine
+	else
+		migrate = xe->tiles[0].migrate;       // neither side is VRAM: tile 0
 ```
 
-If userspace said *don't need*, don't waste I/O writing it out. Discard it.
-Beat A's "cheapest migration discards the cargo."
+This is Chapter 1's `tile->migrate` finally being used. The rule is *use the
+tile that owns the VRAM*, because its blitter has local bandwidth to it.
 
-**`delete_mem_notify`** — the resource is going away; detach VF CCS state, and
-for imported dma-bufs `dma_buf_unmap_attachment()` and drop the sg table.
-
-**`io_mem_reserve`** — "how does the CPU reach this?" For SYSTEM and TT,
-nothing to do (pages). For VRAM, check visibility first, then compute BAR
-offsets:
+Then the copy itself (`:1132`):
 
 ```c
-if (!xe_ttm_resource_visible(xe, mem))
-	return -EINVAL;                       /* outside the window: refuse */
-mem->bus.offset  = mem->start << PAGE_SHIFT;
-mem->bus.offset += vram->io_start;
-mem->bus.is_iomem = true;
-```
-
-Chapter 2's window problem, enforced at CPU-mapping time. A buffer allocated
-top-down (deliberately outside the window) **cannot** be CPU-mapped, and this
-is where that fails.
-
-**`release_notify`** — a subtle one, and a preview:
-
-```c
-dma_resv_for_each_fence(&cursor, &ttm_bo->base._resv, DMA_RESV_USAGE_BOOKKEEP, fence) {
-	if (xe_fence_is_xe_preempt(fence) && !dma_fence_is_signaled(fence)) {
-		if (!replacement)
-			replacement = dma_fence_get_stub();
-		dma_resv_replace_fences(&ttm_bo->base._resv, fence->context,
-					replacement, DMA_RESV_USAGE_BOOKKEEP);
+	if (move_lacks_source) {
+		// Nothing to copy. Just zero the destination.
+		fence = xe_migrate_clear(migrate, bo, new_mem, flags);
+	} else {
+		// Real copy: old location -> new location.
+		fence = xe_migrate_copy(migrate, bo, bo, old_mem, new_mem,
+					handle_system_ccs);
 	}
-}
+
+	// Look at the type of `fence`: struct dma_fence *.
+	// Nothing has been copied yet! We submitted a GPU job and got a promise.
+
+	ret = ttm_bo_move_accel_cleanup(ttm_bo, fence, evict, true, new_mem);
+	// TTM: "park the old resource until this fence signals, install the new
+	//       one, and put the fence on the buffer's clipboard under KERNEL."
+	// Everyone who touches this buffer later will wait on that fence.
 ```
 
-A buffer being destroyed may still carry unsignalled **preempt fences**. Those
-only signal when the VM's exec queues are preempted — and if the VM is going
-away too, that may never happen, so TTM's teardown would wait forever.
-Replacing them with an already-signalled stub breaks the cycle. Chapter 18
-explains what a preempt fence is; file this as "destruction must not wait on a
-promise nobody will keep."
+**Takeaway:** the return type `struct dma_fence *` *is* Idea 3. The move
+function returns a promise, not finished bytes.
 
-## 10. Eviction on demand — `xe_bo.c:3901`
+---
+
+## Step 8 — The one place that must block
+
+**File: `xe_bo.c:1183`**, the end of `xe_bo_move()`.
 
 ```c
-int xe_bo_evict(struct xe_bo *bo, struct drm_exec *exec)
-{
-	struct ttm_placement placement;
+out:
+	if ((!ttm_bo->resource ||
+	     ttm_bo->resource->mem_type == XE_PL_SYSTEM) && ttm_bo->ttm) {
+		// We are landing in XE_PL_SYSTEM. These pages are about to stop
+		// being reachable by the device.
+		dma_resv_wait_timeout(ttm_bo->base.resv,
+				      DMA_RESV_USAGE_KERNEL, false,
+				      MAX_SCHEDULE_TIMEOUT);
+		// So we MUST wait: you cannot un-map memory that a copy engine is
+		// still reading from.
 
-	xe_evict_flags(&bo->ttm, &placement);              /* ask ourselves! */
-	ret = ttm_bo_validate(&bo->ttm, &placement, &ctx);
-	if (ret)
-		return ret;
-
-	dma_resv_wait_timeout(bo->ttm.base.resv, DMA_RESV_USAGE_KERNEL,
-			      false, MAX_SCHEDULE_TIMEOUT);
-	return 0;
-}
+		xe_tt_unmap_sg(xe, ttm_bo->ttm);   // now safe to unmap
+	}
 ```
 
-Elegant: to evict a buffer deliberately, Xe calls **its own `evict_flags`
-callback** to produce the target placement, then validates against it. The
-same code path TTM uses under pressure, driven manually.
+Everything else in this chapter is asynchronous. **This is the exception**, and
+the reason is physical: unmapping memory out from under a running copy would
+corrupt it.
 
-Note the trailing wait: unlike TTM's internal eviction, this one blocks until
-the copy has actually completed. Its callers (suspend, device removal) need the
-data to be *there*, not merely promised. `xe_bo_evict_all()` in
-`xe_bo_evict.c:160` is the suspend-time sweep that uses it.
+---
 
-## Try it yourself
+## The journey, end to end
+
+```
+ Step 1  xe_bo_validate()            xe_bo.c:3302    set up, raise flag, call TTM
+ Step 2  ttm_bo_validate()           ttm_bo.c:1074   already fine? else loop twice
+ Step 3  ttm_bo_alloc_resource()     ttm_bo.c:962    round 1 / round 2 skip line
+ Step 4  ttm_bo_evict_alloc()        ttm_bo.c:720    2 LRU sweeps
+         xe_bo_eviction_valuable()   xe_bo.c:1241    the veto
+ Step 5  xe_bo_move()                xe_bo.c:962     checklist of special cases
+ Step 6  xe_bo_move_notify()         xe_bo.c:805     tell the VMs
+         xe_bo_trigger_rebind()      xe_bo.c:669     normal vs fault-mode fork
+ Step 7  xe_migrate_copy/clear()     xe_bo.c:1132    submit GPU job, get fence
+ Step 8  out:                        xe_bo.c:1183    block only if landing in SYSTEM
+```
+
+## The other callbacks, in one table
+
+TTM asks Xe thirteen questions in total (`xe_bo.c:1828`). We used four of them
+above. Here are the rest, one line each:
+
+| Callback | What it does |
+|----------|-------------|
+| `evict_flags` `:315` | "where should this evicted buffer go?" VRAM→TT, TT→SYSTEM, don't-need→purge |
+| `io_mem_reserve` | "how does the CPU map this?" VRAM → BAR offsets; refuses if outside the window |
+| `swap_notify` | about to swap out — if marked don't-need, discard instead |
+| `delete_mem_notify` | resource going away — detach imported dma-buf pages |
+| `release_notify` | buffer dying — replace unsignalled preempt fences with stubs so teardown can't hang |
+| `ttm_tt_*` (4 of them) | the page list — all covered in Chapter 3 |
+
+One detail from `evict_flags` worth seeing, because it's a lovely trick
+(`xe_bo.c:64`):
+
+```c
+static struct ttm_placement purge_placement;   // no initializer at all!
+```
+
+A zero-initialized `ttm_placement` has `num_placement == 0`. And Step 2's very
+first check was `if (!placement->num_placement) return ttm_bo_pipeline_gutting(bo);`
+— throw the contents away. **"Discard this buffer" is implemented as an
+uninitialized variable.**
+
+## Try it on your machine
 
 ```bash
-# the 13 questions, then the hardest function in Act I
-sed -n '1828,1842p' drivers/gpu/drm/xe/xe_bo.c
-sed -n '962,1200p'  drivers/gpu/drm/xe/xe_bo.c
-
-# every zero-byte "move"
-grep -n 'ttm_bo_move_null' drivers/gpu/drm/xe/xe_bo.c
-
-# the two-pass line, in context
-sed -n '962,1030p' drivers/gpu/drm/ttm/ttm_bo.c
-```
-
-With tracing on, the migration decisions are visible directly:
-
-```bash
+# watch real migrations happen
 echo 1 > /sys/kernel/debug/tracing/events/xe/xe_bo_move/enable
-echo 1 > /sys/kernel/debug/tracing/events/xe/xe_vma_evict/enable
 cat /sys/kernel/debug/tracing/trace_pipe
-```
+# prints: source type, destination type, move_lacks_source
+#         - the three things that pick a rung in Step 5
 
-`trace_xe_bo_move` prints source type, destination type, and
-`move_lacks_source` — the three things that pick the rung.
+# count the zero-byte moves for yourself
+grep -n 'ttm_bo_move_null' drivers/gpu/drm/xe/xe_bo.c
+```
 
 ## Checkpoint
 
-1. In `ttm_bo_alloc_resource()`, what exactly does
-   `place->flags & (force_space ? TTM_PL_FLAG_DESIRED : TTM_PL_FLAG_FALLBACK)`
-   accomplish, and what would break if the ternary were inverted?
-2. `purge_placement` is declared with no initializer. Why is that sufficient,
-   and why does the `dontneed` case in `xe_evict_flags()` refuse to use it?
-3. `ttm_bo_move_null()` is called five times in `xe_bo_move()`. What do the
-   SYSTEM→TT and TT→SYSTEM cases have in common, and why is one of them
-   nonetheless preceded by a blocking wait?
-4. Why does `ttm_bo_evict_alloc()` sweep the LRU twice, with `trylock_only`
-   true the first time?
-5. A normal-mode VM and a fault-mode VM both have a buffer that is being
-   evicted. Trace what happens to each one's page tables.
+1. In Step 3, what does round 1 refuse to look at, and what does round 2 refuse
+   to look at?
+2. Step 5 calls `ttm_bo_move_null()` for `SYSTEM → TT`. Why is copying zero
+   bytes correct there?
+3. Why can't the GPU copy a buffer straight from VRAM to `XE_PL_SYSTEM`?
+4. Why does `xe_bo_eviction_valuable()` return false for a VM that is currently
+   validating?
+5. Everything in Step 7 is asynchronous, but Step 8 blocks. Why?
 
 <details>
 <summary>answers</summary>
 
-1. It inverts which placement entries are skipped per pass: pass 1 (`force_space
-   == false`) skips `FALLBACK` entries, pass 2 skips `DESIRED` ones. Inverting
-   it would make TTM accept the fallback placement before ever trying to evict
-   for the desired one — VRAM would stop being used the moment it first filled.
-2. `num_placement` is 0 in a zero-initialized `ttm_placement`, and
-   `ttm_bo_validate()` treats a zero-entry list as "gut the backing store". The
-   `dontneed` case avoids it because gutting happens inside TTM and would skip
-   `xe_bo_move()` entirely, where Xe's own purge procedure lives; so it asks for
-   `sys_placement` and purges at the top of the move callback instead.
-3. Both move zero bytes — the pages are identical; only their DMA-mapped status
-   changes. TT→SYSTEM must wait first because the pages are about to be
-   unmapped from the device, and any in-flight GPU access to them has to finish
-   before that is safe.
-4. The first sweep is cheap and non-blocking: it only considers victims whose
-   reservation lock is immediately free. Only if that finds no usable victim
-   does it arm the ww-mutex ticket and start genuinely contending for locks,
-   which can wound other threads and force them to retry.
-5. Normal mode: `drm_gpuvm_bo_evict(vm_bo, true)` marks the VM's mappings as
-   needing rebind and the eviction path moves on — no PTE writes now; the
-   rebind worker fixes them before the VM's next submission. Fault mode: the
-   code waits for outstanding GPU work on the buffer, then calls
-   `xe_vm_invalidate_vma()` on every mapping, zapping the PTEs immediately; the
-   mappings come back later via page faults.
+1. Round 1 refuses to look at `FALLBACK` entries (so it only tries the preferred
+   spot, evicting if needed). Round 2 refuses to look at `DESIRED` entries
+   (because those already failed).
+2. The pages don't move. `SYSTEM` and `TT` are the *same* system RAM; the only
+   difference is whether those pages are DMA-mapped for the device. So the move
+   is a status change, not a data copy.
+3. Because the GPU's copy engine does the copying, and `XE_PL_SYSTEM` pages are
+   by definition not reachable by the device. It goes VRAM → TT (real copy),
+   then TT → SYSTEM (zero bytes).
+4. Because that validation is in the middle of collecting a working set. Evicting
+   one of its buffers would make it destroy its own progress, and it would never
+   finish.
+5. Step 8 only runs when the buffer is landing in `XE_PL_SYSTEM`, which means its
+   pages are about to be unmapped from the device. You cannot unmap memory a
+   copy engine may still be reading.
 
 </details>
