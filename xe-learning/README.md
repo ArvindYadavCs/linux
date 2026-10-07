@@ -61,3 +61,4 @@ We never move to the next chapter until both beats of the current one land.
 * [06 — The VM and the VMA](06-the-vm-and-the-vma.md) — story + code
 * [07 — Page Tables](07-page-tables.md) — story + code
 * [08 — VM_BIND End to End](08-vm-bind-end-to-end.md) — story + code
+* [09 — Locking, and Making the GPU Forget](09-locking-and-tlb.md) — story + code
