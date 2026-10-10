@@ -35,21 +35,24 @@ We never move to the next chapter until both beats of the current one land.
 | 7 | Page tables: staging, commit, the GPU writing its own PTEs | `xe_pt.c`, `xe_migrate.c` |
 | 8 | VM_BIND end to end | `xe_vm.c:xe_vm_bind_ioctl` |
 | 9 | Coherency: `dma_resv`, `drm_exec`, TLB invalidation | `xe_tlb_inval.c`, `xe_exec.c` |
-| 10 | userptr, SVM and page faults | `xe_userptr.c`, `xe_svm.c`, `xe_pagefault.c` |
-| 11 | Pinning, eviction, suspend/resume, dma-buf | `xe_bo_evict.c`, `xe_dma_buf.c` |
 
 ### Act II — Scheduling
 | # | Chapter | Main source |
 |---|---------|-------------|
-| 12 | The Cast again: exec queue, LRC, ring, GuC | `xe_exec_queue_types.h`, `xe_lrc_types.h` |
-| 13 | The LRC and the ring: how a batch reaches hardware | `xe_lrc.c`, `xe_ring_ops.c` |
-| 14 | `drm_gpu_scheduler`: entities, jobs, fences | `drm/scheduler/sched_main.c`, `xe_sched_job.c` |
-| 15 | Xe's 1:1 entity:scheduler model and messages | `xe_gpu_scheduler.c` |
-| 16 | GuC submission: CT, registration, G2H | `xe_guc_submit.c`, `xe_guc_ct.c` |
-| 17 | EXEC ioctl end to end | `xe_exec.c` |
-| 18 | Where MM meets scheduling: LR mode, preempt fences, rebind worker | `xe_preempt_fence.c`, `xe_vm.c` |
-| 19 | When things go wrong: TDR, reset, ban, wedge | `xe_guc_submit.c`, `xe_gt.c` |
-| 20 | The full picture: the life of one frame | everything |
+| 10 | The Scheduling Cast: exec queue, LRC, ring, two schedulers | `xe_exec_queue_types.h`, `xe_lrc_types.h` |
+| 11 | `drm_gpu_scheduler`: entities, jobs, fences | `drm/scheduler/sched_main.c`, `xe_sched_job.c` |
+| 12 | GuC submission: CT, registration, G2H, messages | `xe_guc_submit.c`, `xe_guc_ct.c` |
+| 13 | EXEC ioctl end to end | `xe_exec.c` |
+| 14 | Where MM meets scheduling: LR mode, preempt fences, rebind worker | `xe_preempt_fence.c`, `xe_vm.c` |
+| 15 | When things go wrong: TDR, reset, ban, wedge | `xe_guc_submit.c`, `xe_gt.c` |
+| 16 | The full picture: the life of one frame | everything |
+
+### Appendix — optional Act I branches
+Nothing else depends on these; read them whenever.
+| # | Chapter | Main source |
+|---|---------|-------------|
+| A1 | userptr, SVM and page faults | `xe_userptr.c`, `xe_svm.c`, `xe_pagefault.c` |
+| A2 | Pinning, eviction, suspend/resume, dma-buf | `xe_bo_evict.c`, `xe_dma_buf.c` |
 
 ## Chapters written so far
 
@@ -62,3 +65,4 @@ We never move to the next chapter until both beats of the current one land.
 * [07 — Page Tables](07-page-tables.md) — story + code
 * [08 — VM_BIND End to End](08-vm-bind-end-to-end.md) — story + code
 * [09 — Locking, and Making the GPU Forget](09-locking-and-tlb.md) — story + code
+* [10 — The Scheduling Cast](10-the-scheduling-cast.md) — story + code
