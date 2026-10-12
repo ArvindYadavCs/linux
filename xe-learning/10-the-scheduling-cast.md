@@ -96,11 +96,14 @@ In Xe, the LRC and the ring live in **one buffer object**:
 ```
    xe_lrc->bo   (one xe_bo, in VRAM, with a GGTT address)
    +-----------------------------------------------------+
+   |  the ring buffer                     <- offset 0    |
    |  per-process hardware status page (4 KB)            |
    |  the context state image (registers, PT root, ...)  |
-   |  the ring buffer                                    |
    +-----------------------------------------------------+
 ```
+
+(The ring really is first — see the Appendix at the end of this chapter for the
+exact layout, and who reads and writes each region.)
 
 And remember Chapter 5: **this buffer needs a GGTT address**, because the GuC
 and the engine reach it through GGTT, not through the client's PPGTT. That's why
@@ -287,10 +290,10 @@ meaningless.**
 
 ```c
 struct xe_lrc {
-	struct xe_bo *bo;        // <<< ONE buffer object holding:
+	struct xe_bo *bo;        // <<< ONE buffer object holding, IN THIS ORDER:
+				 //      - the ring buffer       (offset 0)
 				 //      - the per-process HW status page
 				 //      - the context state image
-				 //      - the ring buffer
 				 //    In VRAM, with a GGTT address (ch 5).
 
 	struct xe_bo *seqno_bo;  // separate, ALWAYS SYSTEM MEMORY -
@@ -328,8 +331,9 @@ Idea 2's asymmetry, visible as a missing struct member.
 #define LRC_INDIRECT_RING_STATE_SIZE  SZ_4K
 ```
 
-Status page first, then the register image, then the ring. One allocation, three
-regions — which is why `xe_lrc` has a `size` separate from `ring.size`.
+Ring first (offset 0), then the status page, then the register image. One
+allocation, several regions — which is why `xe_lrc` has a `size` separate from
+`ring.size`. The Appendix at the end of this chapter has the full map.
 
 ### Writing into the ring — `xe_lrc.c:1826`
 
@@ -610,5 +614,380 @@ grep -rn 'xe_lrc_ring_size' drivers/gpu/drm/xe/xe_lrc.c
    what tells the hardware "there are new commands". If the tail became visible
    before the commands themselves, the engine would start executing whatever was
    previously in that part of the ring.
+
+</details>
+
+---
+---
+
+# Appendix to Chapter 10 — The LRC, properly
+
+Three questions this answers:
+
+1. **What is actually inside `lrc->bo`?**
+2. **How do you use one buffer object for a dozen different things?**
+3. **Who reads and writes each part — the driver, the engine, or the GuC?**
+
+---
+
+## 1. The layout
+
+`xe_lrc.c:57` has the kernel's own diagram. Here it is, slightly compressed:
+
+```
+  offset                        region                    size
+  ------------------------------------------------------------------------
+  0                       +------------------------+
+                          | RING BUFFER            |  ring_size (e.g. 16 KB)
+  lrc->ring.size          +------------------------+
+                          | PPHWSP                 |  4 KB
+                          |  (+ driver's own SW    |
+                          |   state in the back    |
+                          |   half)                |
+  + 4 KB                  +------------------------+
+                          | ENGINE CONTEXT IMAGE   |  n * 4 KB
+                          |  (the register state)  |
+                          +------------------------+
+                          | indirect ring state    |  0 or 4 KB
+                          +------------------------+
+                          | indirect context page  |  0 or 4 KB
+                          +------------------------+
+                          | WA batch buffer        |  4 KB
+  xe_bo_size(lrc->bo)     +------------------------+
+```
+
+**The ring is first.** That is what surprised me into getting it wrong, and the
+code is unambiguous:
+
+```c
+static inline u32 __xe_lrc_ring_offset(struct xe_lrc *lrc)
+{
+	return 0;                      // <<< the ring starts at byte 0
+}
+
+u32 xe_lrc_pphwsp_offset(struct xe_lrc *lrc)
+{
+	return lrc->ring.size;         // <<< status page comes AFTER the ring
+}
+
+u32 xe_lrc_regs_offset(struct xe_lrc *lrc)
+{
+	return xe_lrc_pphwsp_offset(lrc) + LRC_PPHWSP_SIZE;   // then registers
+}
+```
+
+And the allocation, `xe_lrc.c:1636`:
+
+```c
+	const u32 lrc_size = xe_gt_lrc_size(gt, hwe->class);
+	u32 bo_size = ring_size + lrc_size + LRC_WA_BB_SIZE;
+	//            ^^^^^^^^^   ^^^^^^^^   ^^^^^^^^^^^^^^^
+	//            the ring  + status page + registers + 4 KB
+
+	bo_flags = XE_BO_FLAG_VRAM_IF_DGFX(tile) | XE_BO_FLAG_GGTT |
+		   XE_BO_FLAG_GGTT_INVALIDATE;
+	//         ^^^ VRAM if discrete (ch 2), AND a GGTT address (ch 5)
+
+	bo = xe_bo_create_pin_map_novm(xe, tile, bo_size, ttm_bo_type_kernel,
+				       bo_flags, false);
+	lrc->bo = bo;
+```
+
+Note `xe_bo_create_pin_map`: **pinned** (it can never be evicted — the engine may
+touch it at any moment) and **mapped** (the driver keeps a permanent CPU
+pointer). Both matter below.
+
+### How big is the register image?
+
+Not fixed — it depends on the engine. `xe_gt_lrc_hang_replay_size()` at `:114`:
+
+```c
+	case XE_ENGINE_CLASS_RENDER:
+		if (GRAPHICS_VERx100(xe) >= 3510)  size += 7 * SZ_4K;
+		else if (GRAPHICS_VER(xe) >= 20)   size += 3 * SZ_4K;
+		else                               size += 13 * SZ_4K;
+		break;
+	...
+	case XE_ENGINE_CLASS_COPY:
+	case XE_ENGINE_CLASS_VIDEO_DECODE:
+		size += 1 * SZ_4K;             // <<< copy/video: ONE page
+```
+
+**A render context needs 3–13 pages of state. A copy context needs one.** That
+is a direct measure of how much more complicated a 3D pipeline is than a
+blitter — all those shader, sampler and fixed-function registers have to be
+saved and restored on every context switch.
+
+### And a second, separate buffer
+
+```c
+	bo = xe_bo_create_pin_map_novm(xe, tile, PAGE_SIZE, ttm_bo_type_kernel,
+				       XE_BO_FLAG_GGTT |
+				       XE_BO_FLAG_GGTT_INVALIDATE |
+				       XE_BO_FLAG_SYSTEM, false);
+	//                             ^^^^^^^^^^^^^^^^^^ SYSTEM, not VRAM
+	lrc->seqno_bo = bo;
+```
+
+One page, in **system memory**, holding two numbers at offsets 0 and 8:
+
+```c
+#define LRC_SEQNO_OFFSET       0
+#define LRC_START_SEQNO_OFFSET (LRC_SEQNO_OFFSET + 8)
+```
+
+The GPU writes these when a job starts and finishes (Chapter 10's ring
+sandwich). The **CPU** polls them. CPU reads from VRAM through the BAR are
+glacial, so this one lives in cached system RAM — which is why it's a separate
+buffer rather than part of `lrc->bo`.
+
+---
+
+## 2. How one buffer serves a dozen purposes: two views, many offsets
+
+This is the mechanism you asked about, and it's one elegant macro.
+
+Every region needs to be reachable **two different ways**:
+
+* the **driver** needs a CPU pointer, to write commands and read counters
+* the **GPU and GuC** need a GGTT address, because that's how they address memory
+
+So `xe_lrc.c:813` generates both for each region:
+
+```c
+#define DECL_MAP_ADDR_HELPERS(elem, bo_expr)                                \
+static inline struct iosys_map __xe_lrc_##elem##_map(struct xe_lrc *lrc)    \
+{                                                                            \
+	struct xe_bo *bo = (bo_expr);                                        \
+	struct iosys_map map = bo->vmap;      /* the permanent CPU mapping */\
+	iosys_map_incr(&map, __xe_lrc_##elem##_offset(lrc));                 \
+	return map;                           /* CPU pointer to this region */\
+}                                                                            \
+static inline u32 __xe_lrc_##elem##_ggtt_addr(struct xe_lrc *lrc)            \
+{                                                                            \
+	struct xe_bo *bo = (bo_expr);                                        \
+	return xe_bo_ggtt_addr(bo) + __xe_lrc_##elem##_offset(lrc);           \
+}                                           /* GPU address of this region */ \
+```
+
+Then one line per region:
+
+```c
+DECL_MAP_ADDR_HELPERS(ring,              lrc->bo)
+DECL_MAP_ADDR_HELPERS(pphwsp,            lrc->bo)
+DECL_MAP_ADDR_HELPERS(regs,              lrc->bo)
+DECL_MAP_ADDR_HELPERS(parallel,          lrc->bo)
+DECL_MAP_ADDR_HELPERS(engine_id,         lrc->bo)
+DECL_MAP_ADDR_HELPERS(ctx_timestamp,     lrc->bo)
+DECL_MAP_ADDR_HELPERS(queue_timestamp,   lrc->bo)
+DECL_MAP_ADDR_HELPERS(indirect_ring,     lrc->bo)
+DECL_MAP_ADDR_HELPERS(seqno,             lrc->seqno_bo)   // <- the other BO
+DECL_MAP_ADDR_HELPERS(start_seqno,       lrc->seqno_bo)   // <- the other BO
+```
+
+**That's the whole technique.** `base + offset`, twice:
+
+```
+                       lrc->bo
+            CPU view                     GPU view
+         bo->vmap  +  offset      xe_bo_ggtt_addr(bo) + offset
+              |                              |
+              v                              v
+      driver reads/writes            engine & GuC read/write
+```
+
+So "how is the `xe_bo` used" has a short answer: **it is pinned and permanently
+CPU-mapped, and every piece of LRC state is just a named offset into it, exposed
+as a CPU pointer and a GGTT address.** The 20-odd `__xe_lrc_*_offset()` functions
+above the macro are the complete list of things an LRC holds.
+
+### Seeing both views used
+
+**CPU view** — writing commands into the ring (`xe_lrc.c:1826`):
+
+```c
+	ring = __xe_lrc_ring_map(lrc);          // CPU pointer to the ring region
+	__xe_lrc_write_ring(lrc, ring, data, size);
+```
+
+**GPU view** — telling the engine where to write "job finished"
+(`xe_ring_ops.c`):
+
+```c
+	i = emit_flush_imm_ggtt(xe_lrc_seqno_ggtt_addr(lrc), seqno, 0, dw, i);
+	//                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^ a GGTT address,
+	//   baked into a command the GPU will execute. The GPU cannot use a
+	//   CPU pointer, so this is the only form that works.
+```
+
+Same buffer family, two completely different kinds of address, from the same
+macro.
+
+---
+
+## 3. Who touches what
+
+The table that makes the whole thing make sense:
+
+| Region | Written by | Read by | Why |
+|--------|-----------|---------|-----|
+| **ring buffer** | **driver** (CPU) | **engine** | the command stream |
+| **ring tail** (in the register image) | **driver** / GuC | engine | "there are new commands" |
+| **ring head** | **engine** | driver (for debug) | "I've consumed up to here" |
+| **PPHWSP, front half** | **engine** | driver | hardware's own scratch area |
+| **PPHWSP, back half** | **driver** | driver, GuC | Xe's own bookkeeping (below) |
+| **context register image** | **driver** (once, at init) then **engine** | engine | saved/restored on every context switch |
+| **ctx/queue timestamps** | **engine** | driver | how long this context has run |
+| **seqno / start_seqno** (other BO) | **engine** | **driver** (CPU) | job completion → fences |
+| **WA batch buffer** | driver (once) | engine | workaround commands run at switch |
+
+Two rows deserve emphasis.
+
+**The register image is written by the driver exactly once, then belongs to the
+hardware.** At init the driver fills it in; after that, every context switch has
+the engine saving its registers into it and restoring from it. The driver only
+reads it afterwards (for debugging, or hang dumps).
+
+**The PPHWSP is shared, split down the middle.** The front is defined by
+hardware; the back half Xe uses for its own fields, at fixed offsets
+(`xe_lrc.c:707`):
+
+```c
+#define LRC_CTX_JOB_TIMESTAMP_OFFSET 512
+#define LRC_ENGINE_ID_PPHWSP_OFFSET  1024
+#define LRC_PARALLEL_PPHWSP_OFFSET   2048
+```
+
+with comments saying so outright: *"This is stored in the driver-defined portion
+of PPHWSP."* Free real estate inside a page the hardware already touches.
+
+---
+
+## 4. Where the register image's initial contents come from
+
+You can't just zero it — a context image has hundreds of registers that need
+sane starting values. So Xe keeps a **golden image** per engine class, captured
+once, and copies it (`xe_lrc.c:1505`):
+
+```c
+	map = __xe_lrc_pphwsp_map(lrc);
+
+	if (gt->default_lrc[hwe->class] || replay_state) {
+		xe_map_memset(xe, &map, 0, 0, LRC_PPHWSP_SIZE);     /* zero PPHWSP */
+		xe_map_memcpy_to(xe, &map, LRC_PPHWSP_SIZE,
+				 gt->default_lrc[hwe->class] + LRC_PPHWSP_SIZE,
+				 lrc->size - LRC_PPHWSP_SIZE);
+		//  ^^^ COPY the golden register image for this engine class
+	} else {
+		void *init_data = empty_lrc_data(hwe);   // first time: build one
+		xe_map_memcpy_to(xe, &map, 0, init_data, lrc->size);
+	}
+
+	if (vm)
+		xe_lrc_set_ppgtt(lrc, vm);
+	//  ^^^ then patch in THIS context's page table root (ch 7).
+	//      This single call is what binds an exec queue to its address space.
+```
+
+`gt->default_lrc[class]` is per-GT and per-engine-class. **Creating an exec queue
+is mostly a `memcpy` of a prepared image, then one patch.**
+
+And that last line is worth dwelling on: **`xe_lrc_set_ppgtt()` is the physical
+link between Act I and Act II.** Chapter 7's `vm->pt_root[tile->id]` gets written
+into this context's register image. That is how "this queue uses that address
+space" is expressed in hardware.
+
+---
+
+## 5. What the GuC is actually given
+
+Not a struct. One 64-bit number (`xe_lrc.c:1861`):
+
+```c
+u64 xe_lrc_descriptor(struct xe_lrc *lrc)
+{
+	return lrc->desc | xe_lrc_ggtt_addr(lrc);
+	//     ^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^
+	//     flags       the GGTT address of lrc->bo
+	//     (LRC_VALID, priority, ...)
+}
+```
+
+And where it goes — `xe_guc_submit.c:1000`, registering the context:
+
+```c
+	info.hwlrca_lo = lower_32_bits(xe_lrc_descriptor(lrc));
+	info.hwlrca_hi = upper_32_bits(xe_lrc_descriptor(lrc));
+	//   ^^^^^^^ "hardware LRC address". This is the entire handoff.
+```
+
+**Everything the GuC and the engine know about a context, they learn by
+following that address.** The descriptor is a pointer with flags in the spare
+bits — which is exactly why the LRC needed a GGTT address in the first place.
+
+---
+
+## The whole thing in one picture
+
+```
+  EXEC_QUEUE_CREATE
+        |
+        +-- allocate lrc->bo        (VRAM, pinned, GGTT address, CPU-mapped)
+        |     ring at 0 | PPHWSP | register image | ... | WA BB
+        |
+        +-- allocate lrc->seqno_bo  (system memory, 1 page, 2 counters)
+        |
+        +-- memcpy gt->default_lrc[class]  -> the register image
+        +-- xe_lrc_set_ppgtt(lrc, vm)      -> patch in the page table root
+        |
+        +-- register with GuC:  hwlrca = xe_lrc_descriptor(lrc)
+                                       = flags | GGTT addr of lrc->bo
+
+  EXEC
+        |
+        +-- driver, via CPU map:   write commands into the ring
+        +-- driver:                bump lrc->ring.tail
+        +-- tell the GuC the queue has work
+        |
+        +-- GuC: load this context onto an engine  (engine reads the
+        |        register image via the GGTT address)
+        +-- engine: execute the ring; write seqno into seqno_bo
+        |
+        +-- driver, via CPU read of seqno_bo: fence signals
+```
+
+## Checkpoint
+
+1. Where in `lrc->bo` does the ring buffer live, and what comes after it?
+2. A render LRC is much bigger than a copy LRC. Why?
+3. `DECL_MAP_ADDR_HELPERS` generates two functions per region. What are they for,
+   and why can't one serve both purposes?
+4. The register image is written by the driver. How many times, and who owns it
+   after that?
+5. What exactly does the GuC receive when a context is registered?
+
+<details>
+<summary>answers</summary>
+
+1. At offset 0 — `__xe_lrc_ring_offset()` returns 0. Then the 4 KB PPHWSP
+   (`xe_lrc_pphwsp_offset()` returns `lrc->ring.size`), then the engine context
+   register image, then optional indirect pages, then a 4 KB workaround batch
+   buffer.
+2. Because the register image holds all the state that must be saved and restored
+   on a context switch, and a 3D/compute pipeline has vastly more of it than a
+   blitter: 3–13 pages for render versus 1 page for copy or video.
+3. One returns an `iosys_map` — a CPU pointer into the buffer's permanent kernel
+   mapping — for the driver to read and write. The other returns a GGTT address,
+   for baking into commands the GPU executes or handing to the GuC. They can't be
+   the same because a CPU virtual address is meaningless to the GPU and a GGTT
+   address is meaningless to the CPU.
+4. Once, at creation: a `memcpy` of `gt->default_lrc[class]` (the golden image for
+   that engine class), followed by `xe_lrc_set_ppgtt()` patching in the VM's page
+   table root. After that the hardware owns it — the engine saves and restores it
+   on every context switch, and the driver only reads it for debugging.
+5. A single 64-bit descriptor: `lrc->desc | xe_lrc_ggtt_addr(lrc)` — flags in the
+   spare bits, plus the GGTT address of `lrc->bo`. It reaches the GuC as
+   `info.hwlrca_lo/hi`. Everything else about the context is found by following
+   that address.
 
 </details>
