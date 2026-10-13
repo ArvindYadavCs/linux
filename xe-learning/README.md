@@ -67,3 +67,4 @@ Nothing else depends on these; read them whenever.
 * [09 — Locking, and Making the GPU Forget](09-locking-and-tlb.md) — story + code
 * [10 — The Scheduling Cast](10-the-scheduling-cast.md) — story + code + LRC appendix
 * [11 — The Waiting Room](11-the-scheduler.md) — story + code
+* [12 — Talking to the GuC](12-talking-to-the-guc.md) — story + code
