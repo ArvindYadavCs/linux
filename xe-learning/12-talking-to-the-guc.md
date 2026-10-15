@@ -2,366 +2,228 @@
 
 > Beat A: the story.
 
-Three times now I've written *"...and tell the GuC"* and moved on. This chapter
-is what that actually means.
+Three times I've written *"...and tell the GuC"* and moved on. Here is what that
+one phrase actually is.
 
-The spine:
-
-> *A job's dependencies have all signalled. `run_job()` has been called.*
+> *A job's dependencies have signalled. `run_job()` has been called.*
 > *Get this work onto an engine.*
 
-Three ideas.
+Three ideas, and they are short.
 
 ---
 
-## Idea 1: The channel is a ring buffer in memory
+## Idea 1: A mailbox in memory
 
-The GuC is a separate processor on the other side of the chip. The driver can't
-call its functions. It has to send it messages.
+The GuC is a separate processor. The driver can't call its functions, so it
+leaves **letters in a mailbox**.
 
-And the mechanism will look familiar, because it's **exactly the ring buffer
-from Chapter 10**, used again:
+The mailbox is a ring buffer in memory — **the same structure as Chapter 10's
+command ring**. The sender writes at the tail; the receiver reads from the head;
+a small descriptor beside it holds both numbers.
 
-* a **shared buffer in memory**, which both sides can read and write
-* the **sender** writes at the tail and advances it
-* the **receiver** reads from the head and advances it
-* a small **descriptor** next to it holds the head and tail
-
-There are **two** of them, because messages go both ways:
+There are two mailboxes, because letters go both ways:
 
 ```
-   H2G  (Host to GuC)          "register this context"
-                               "this context has work"
-      driver writes ---------------------------> GuC reads
-
-   G2H  (GuC to Host)          "that context is now scheduled"
-                               "that context hung"
-      GuC writes   <--------------------------- driver reads
+   H2G  "Host to GuC"      driver writes  --->  GuC reads
+   G2H  "GuC to Host"      driver reads   <---  GuC writes
 ```
 
-Together they're called **CT** — Command Transport. **CTB** is one of the two
-buffers.
+Together they're called **CT** (Command Transport).
 
-Two details worth having now:
+Two facts and that's all you need:
 
-**They live in GGTT.** Of course they do — the GuC can only reach memory through
-GGTT (Chapter 5, Idea 3). This is one of the GGTT users from that chapter's
-table.
-
-**The driver notifies, it doesn't wait.** After writing a message the driver
-bumps the tail in the descriptor and carries on. The GuC picks it up when it
-gets to it. Replies arrive later as an interrupt, which queues a worker to drain
-the G2H buffer.
-
-So the whole conversation is asynchronous in both directions.
+* **They live in GGTT**, because that's the only memory the GuC can reach
+  (Chapter 5).
+* **Nobody waits.** You drop a letter in and carry on. Replies arrive later as
+  an interrupt.
 
 ---
 
-## Idea 2: "Tell the GuC" is a two-word message
+## Idea 2: The letter is two words long
 
-Here is the punchline, and it's smaller than you'd expect.
+Here's the punchline.
 
-After Chapter 10's ring writing — which put the actual commands in the LRC's
-ring and bumped its tail — the message to the GuC is:
-
-```
-   [ XE_GUC_ACTION_SCHED_CONTEXT ,  guc_id ]
-```
-
-**Two dwords.** An action code, and the GuC's ID for this context. That's the
-entire submission.
-
-Not the batch address. Not the job. Not the ring contents. Just *"context 37 has
-work."* The GuC already knows everything else, because the context was
-**registered** earlier.
-
-### Registration is where the real information goes
-
-The first time a queue is used, the driver sends a bigger message:
+After Chapter 10's work — writing the actual commands into the LRC's ring and
+bumping its tail — the letter to the GuC is:
 
 ```
-   [ XE_GUC_ACTION_REGISTER_CONTEXT,
-     flags, context_idx, engine_class, engine_submit_mask,
-     ... ,
-     hwlrca_lo, hwlrca_hi ]            <-- the LRC descriptor
+   [ SCHED_CONTEXT ,  guc_id ]
 ```
 
-That `hwlrca` is the 64-bit descriptor from the LRC appendix:
-`flags | GGTT address of lrc->bo`. **Everything the GuC needs to know about the
-context, it learns by following that address** — the ring, the register state,
-the page table root, all of it.
+**Two dwords.** An action code, and the GuC's ID number for this context.
 
-So the division of labour is:
+Not the batch address. Not the job. Not the commands. Just *"context 37 has
+work."*
 
-| When | Message | Carries |
-|------|---------|---------|
-| once, on first use | `REGISTER_CONTEXT` | where the context lives (its LRC) |
-| every submission | `SCHED_CONTEXT` | just "this one has work" |
+### Why so little?
 
-Register once, then poke cheaply forever. That's why a submission is two dwords.
-
-### And a third state: enabled
-
-There's one wrinkle. A registered context can be **scheduling-enabled** or not.
-A context with no work gets disabled so the GuC doesn't waste time considering
-it. So the *first* submission after an idle period sends a slightly bigger
-message — *"turn scheduling on for context 37"* — and that one **does** get a
-reply, because the driver needs to know when it took effect.
-
-Three states, and you'll see all three in the code:
+Because everything else was said **once**, earlier. The first time a queue is
+used, the driver sends a bigger letter:
 
 ```
-   not registered  --REGISTER_CONTEXT-->  registered, disabled
-                                                |
-                                      SCHED_CONTEXT_MODE_SET(ENABLE)
-                                                |
-                                                v
-                                          registered, enabled
-                                                |
-                                          SCHED_CONTEXT  (x N)
+   [ REGISTER_CONTEXT, ..., hwlrca ]
 ```
+
+where `hwlrca` is the LRC descriptor from the appendix — **the GGTT address of
+`lrc->bo`**. One pointer. The GuC follows it to find the ring, the register
+state, the page table root, everything.
+
+So:
+
+| When | Letter | Says |
+|------|--------|------|
+| once, on first use | `REGISTER_CONTEXT` | "this context lives at *this address*" |
+| every submission | `SCHED_CONTEXT` | "it has work" |
+
+**Register once. Poke cheaply, forever.** That second line is the hot path of the
+whole driver.
 
 ---
 
-## Idea 3: Queue operations travel with the jobs
+## Idea 3: The GuC only writes back when something is wrong
 
-Last idea, and it's the reason Chapter 10's `xe_gpu_scheduler` had a message
-list bolted onto it.
+You'd expect a "job finished" letter in the G2H mailbox. **There isn't one.**
 
-Some things you do to a queue aren't jobs, but **must be ordered against the
-jobs**:
+Job completion goes a completely different way, and we already saw it in
+Chapter 10: the engine's last commands write a sequence number into memory and
+raise an interrupt. The interrupt handler signals the fence. No mailbox
+involved.
 
-* suspend it
-* resume it
-* change its priority or timeslice
-* tear it down
+Why? Speed. Every frame completes many jobs; routing each one through a
+microcontroller's mailbox would be far too slow.
 
-Consider why ordering matters: if you tear down a queue while a job is still in
-flight, you free a context the GuC is actively running. If you change priority
-"at the same time" as submitting, the result is undefined.
+So what *does* come back on G2H? Almost entirely bad news:
 
-The obvious fix would be a lock around everything. Xe does something cheaper:
+* "that context hung, and I reset it"
+* "a context took a page fault"
+* "there was a bad memory access"
+* plus a few control acknowledgements
 
-> **Put those operations in the same queue as the jobs.**
-
-The scheduler already processes jobs in order. Adding a message list that is
-drained by the same machinery means a message is naturally ordered against the
-jobs before and after it — no extra locking, no races.
-
-Four opcodes, and that's the whole set:
-
-```c
-#define CLEANUP          1     /* tear this queue down */
-#define SET_SCHED_PROPS  2     /* priority / timeslice / preempt timeout */
-#define SUSPEND          3     /* stop running it (ch 14's preempt fences) */
-#define RESUME           4     /* start again */
-```
-
-Each one becomes an H2G message to the GuC when the scheduler gets to it.
+> **Work completes through memory and an interrupt. The mailbox is for control
+> and for trouble.**
 
 ---
 
 ## The picture
 
 ```
-                     THE DRIVER                   |        THE GuC
-                                                  |
-   run_job()                                      |
-     |                                            |
-     +-- write commands into the LRC's ring (ch10)|
-     +-- bump lrc->ring.tail                      |
-     |                                            |
-     +-- is this context registered?              |
-     |     no -> H2G: REGISTER_CONTEXT            |
-     |              { ..., hwlrca = GGTT addr }---+--> records it
-     |                                            |
-     +-- is scheduling enabled?                   |
-     |     no -> H2G: SCHED_CONTEXT_MODE_SET -----+--> enables it
-     |              { guc_id, ENABLE }            |    ...later...
-     |            <-------------------------------+--- G2H: MODE_DONE
-     |                                            |
-     +-- H2G: SCHED_CONTEXT { guc_id } -----------+--> "has work"
-     |                                            |
-     +-- return the hardware fence                |    GuC now decides
-                                                  |    when & where to run it
-   ... engine executes the ring ...               |
-   ... LRC seqno written -> fence signals ...     |
+      THE DRIVER                                 |     THE GuC
+                                                 |
+  run_job()                                      |
+    |                                            |
+    1. write the commands into the LRC's ring    |
+       (Chapter 10) and bump its tail            |
+    |                                            |
+    2. first time only:                          |
+       H2G letter: REGISTER_CONTEXT -------------+--> remembers the address
+                   { ..., hwlrca }               |
+    |                                            |
+    3. every time:                               |
+       H2G letter: SCHED_CONTEXT ----------------+--> "ok, it has work"
+                   { guc_id }                    |
+    |                                            |     GuC now decides
+    4. return the hardware fence                 |     when and where to run it
+                                                 |
+  ... engine runs the ring ...
+  ... writes a seqno to memory, raises an interrupt ...
+  ... fence signals ...                              (NOT via the mailbox)
 ```
 
 ## Remember these three
 
-1. **The channel is two ring buffers in GGTT** — H2G down, G2H up — and both
-   directions are asynchronous.
-2. **Submission is two dwords: an action code and a context ID.** All the real
-   information went across once, at registration, as the LRC's GGTT descriptor.
-3. **Queue operations (suspend, resume, priority, teardown) travel as messages
-   in the same queue as the jobs**, which is how they get ordered for free.
+1. **Two mailboxes in GGTT** — H2G down, G2H up. Nobody waits.
+2. **A submission is two dwords**, because the context's address was sent once
+   at registration.
+3. **Completion comes through memory and an interrupt, not the mailbox.** The
+   mailbox carries control messages and bad news.
 
 ---
 ---
 
 # Chapter 12 — Beat B: The Code
 
-Five functions, following one submission down:
+One straight line, four steps:
 
-| Function | File | Job |
-|----------|------|-----|
-| `guc_exec_queue_run_job()` | `xe_guc_submit.c:1205` | the `drm_sched` callback |
-| `register_exec_queue()` | `xe_guc_submit.c:985` | first-use registration |
-| `submit_exec_queue()` | `xe_guc_submit.c:1145` | **the two-dword poke** |
-| `h2g_write()` | `xe_guc_ct.c:941` | put a message in the ring |
-| `process_g2h_msg()` | `xe_guc_ct.c:1655` | dispatch replies |
+> *`run_job()` is called → bytes land in the H2G mailbox.*
 
-> Code trimmed: parallel submission, multi-queue, SR-IOV and replay paths
+| Step | Function | File |
+|------|----------|------|
+| 1 | `guc_exec_queue_run_job()` | `xe_guc_submit.c:1205` |
+| 2 | `register_exec_queue()` | `xe_guc_submit.c:985` |
+| 3 | `submit_exec_queue()` | `xe_guc_submit.c:1145` |
+| 4 | `h2g_write()` | `xe_guc_ct.c:941` |
+
+> Code trimmed hard — error paths, parallel submission, SR-IOV and multi-queue
 > removed. `//` comments are mine.
 
 ---
 
-## Step 0 — The two buffers
+## Step 1 — Three things happen
 
-**File: `xe_guc_ct_types.h`**
-
-```c
-struct guc_ctb {
-	struct xe_bo *bo;           // the shared buffer (in GGTT - ch 5)
-	struct iosys_map desc;      // CPU map of the DESCRIPTOR (head/tail/status)
-	struct iosys_map cmds;      // CPU map of the MESSAGE AREA
-	struct guc_ctb_info info;
-};
-
-struct guc_ctb_info {
-	u32 size;        // in dwords
-	u32 head;        // where the reader is
-	u32 tail;        // where the writer is
-	u32 space;       // how much room is left
-	bool broken;     // channel is dead
-};
-
-struct xe_guc_ct {
-	struct mutex lock;            // one sender at a time
-	struct {
-		struct guc_ctb h2g;   // <<< IDEA 1: down
-		struct guc_ctb g2h;   // <<< IDEA 1: up
-	} ctbs;
-
-	u32 g2h_outstanding;          // how many replies we're still owed
-	struct work_struct g2h_worker;// drains g2h after an interrupt
-
-	enum xe_guc_ct_state state;
-	u32 fence_seqno;              // numbers our requests
-	struct xarray fence_lookup;   // seqno -> who is waiting for the reply
-};
-```
-
-Compare `guc_ctb_info` with `xe_lrc->ring` from Chapter 10 — `size`, `head`,
-`tail`. **Same data structure, different participants.** The LRC ring is
-driver→engine; this one is driver→GuC.
-
-And `fence_lookup` is how an asynchronous reply finds its waiter: each request
-carries a sequence number, the reply carries it back, and the xarray maps it to
-whoever asked.
-
----
-
-## Step 1 — `run_job()`: the door from Chapter 11
-
-**File: `xe_guc_submit.c:1205`.** This is the callback `drm_sched` invoked at the
-end of Chapter 11.
+**`xe_guc_submit.c:1205`.** This is the `run_job()` callback from Chapter 11.
 
 ```c
 static struct dma_fence *guc_exec_queue_run_job(struct drm_sched_job *drm_job)
 {
 	struct xe_sched_job *job = to_xe_sched_job(drm_job);
 	struct xe_exec_queue *q = job->q;
-	bool killed_or_banned_or_wedged = exec_queue_killed_or_banned_or_wedged(q);
 
-	trace_xe_sched_job_run(job);
+	if (!exec_queue_registered(q))
+		register_exec_queue(q, GUC_CONTEXT_NORMAL);   // STEP 2 (first use)
 
-	if (!killed_or_banned_or_wedged && !xe_sched_job_is_error(job)) {
-		if (!exec_queue_registered(q))
-			register_exec_queue(q, GUC_CONTEXT_NORMAL);  // <<< step 2
-			//  ^^^ FIRST USE ONLY (Idea 2)
+	q->ring_ops->emit_job(job);                           // CHAPTER 10
+						              // (write the ring)
 
-		if (!job->restore_replay)
-			q->ring_ops->emit_job(job);                  // <<< CHAPTER 10
-			//  ^^^ write the command sandwich into the LRC's ring
+	submit_exec_queue(q, job);                            // STEP 3
 
-		submit_exec_queue(q, job);                           // <<< step 3
-	}
-
-run_job_out:
-	return job->fence;
-	//     ^^^^^^^^^^ Chapter 11's "parent" - the hardware fence that was
-	//     pre-allocated at job creation. It signals when the LRC's seqno
-	//     counter reaches this job's number.
+	return job->fence;      // Chapter 11's "parent" fence
 }
 ```
 
-**Three lines of substance**, and they are the three ideas in order: register if
-needed, write the ring (Chapter 10), poke the GuC.
-
-Note the guard: a killed or banned queue skips all of it and the function still
-returns a fence — which will signal with an error. `drm_sched` must always get a
-fence back, even for work that will never run.
+**Three lines of substance.** Register if needed, write the commands, poke the
+GuC. That's the whole function, and it's the whole chapter.
 
 ---
 
-## Step 2 — Registration: the one big message
+## Step 2 — Registration (once per queue)
 
-**File: `xe_guc_submit.c:985`** — gather the information:
+**`xe_guc_submit.c:985`** gathers the facts:
 
 ```c
-	memset(&info, 0, sizeof(info));
-	info.context_idx  = q->guc->id;                      // the GuC's ID for us
-	info.engine_class = xe_hwe_to_guc_class(q->hwe);     // render / copy / ...
-	info.engine_submit_mask =
-		xe_hwe_guc_logical_to_submit_mask(q->hwe, q->logical_mask);
-	//      ^^^ which engine instances this queue may run on
+	info.context_idx  = q->guc->id;                   // our ID number
+	info.engine_class = xe_hwe_to_guc_class(q->hwe);  // render / copy / video
 
 	info.hwlrca_lo = lower_32_bits(xe_lrc_descriptor(lrc));
 	info.hwlrca_hi = upper_32_bits(xe_lrc_descriptor(lrc));
-	//   ^^^^^^^ IDEA 2. The LRC appendix's descriptor:
-	//           flags | GGTT address of lrc->bo.
-	//           This is the ONLY pointer the GuC gets, and everything about
-	//           the context hangs off it.
-
-	info.flags = CONTEXT_REGISTRATION_FLAG_KMD |
-		FIELD_PREP(CONTEXT_REGISTRATION_FLAG_TYPE, ctx_type);
+	//   ^^^^^^^ IDEA 2: the GGTT address of lrc->bo.
+	//           The only pointer the GuC ever gets.
 ```
 
-**`xe_guc_submit.c:935`** — send it:
+**`xe_guc_submit.c:935`** sends them:
 
 ```c
-static void __register_exec_queue(struct xe_guc *guc,
-				  struct guc_ctxt_registration_info *info)
-{
 	u32 action[] = {
 		XE_GUC_ACTION_REGISTER_CONTEXT,
 		info->flags,
 		info->context_idx,
 		info->engine_class,
 		info->engine_submit_mask,
-		info->wq_desc_lo,  info->wq_desc_hi,     // parallel submission only
-		info->wq_base_lo,  info->wq_base_hi,
-		info->wq_size,
-		info->hwlrca_lo,   info->hwlrca_hi,      // <<< the LRC address
+		...
+		info->hwlrca_lo,                 // <<< the address
+		info->hwlrca_hi,
 	};
 
 	xe_guc_ct_send(&guc->ct, action, ARRAY_SIZE(action), 0, 0);
-	//                                                   ^  ^
-	//                                        no reply expected
-}
 ```
 
-**Twelve dwords, sent once per queue.** A plain array of `u32` — that is
-genuinely what an H2G message is. And the last two arguments being `0, 0` mean
-"no G2H reply expected"; registration is fire-and-forget.
+**A letter is just a `u32[]`.** That's genuinely all an H2G message is — an array
+of dwords, first one being the action code.
 
 ---
 
-## Step 3 — The poke
+## Step 3 — The poke (every submission)
 
-**File: `xe_guc_submit.c:1145`.** The function Idea 2 is about:
+**`xe_guc_submit.c:1145`.** The function Idea 2 is about:
 
 ```c
 static void submit_exec_queue(struct xe_exec_queue *q, struct xe_sched_job *job)
@@ -370,308 +232,193 @@ static void submit_exec_queue(struct xe_exec_queue *q, struct xe_sched_job *job)
 	u32 action[3];
 	int len = 0;
 
-	xe_gt_assert(guc_to_gt(guc), exec_queue_registered(q));
-	//                           ^^^ we must already be registered
-
 	xe_lrc_set_ring_tail(lrc, lrc->ring.tail);
-	//  ^^^ CHAPTER 10: publish the tail into the context image, so the
-	//      engine will see the commands emit_job() just wrote.
+	//  ^^^ Chapter 10: publish the tail, so the engine will see the
+	//      commands emit_job() just wrote.
 
-	if (!exec_queue_enabled(q)) {
-		// ---- FIRST submission after idle: turn scheduling ON ----
-		action[len++] = XE_GUC_ACTION_SCHED_CONTEXT_MODE_SET;
-		action[len++] = q->guc->id;
-		action[len++] = GUC_CONTEXT_ENABLE;
-		g2h_len = G2H_LEN_DW_SCHED_CONTEXT_MODE_SET;
-		num_g2h = 1;                  // <<< this one DOES want a reply
-		set_exec_queue_pending_enable(q);
-		set_exec_queue_enabled(q);
-	} else {
-		// ---- STEADY STATE: just say "I have work" ----
-		action[len++] = XE_GUC_ACTION_SCHED_CONTEXT;
-		action[len++] = q->guc->id;
-		//              ^^^^^^^^^^ TWO DWORDS. THAT IS THE SUBMISSION.
-	}
+	action[len++] = XE_GUC_ACTION_SCHED_CONTEXT;
+	action[len++] = q->guc->id;
+	//              ^^^^^^^^^^ TWO DWORDS. THAT IS THE SUBMISSION.
 
 	xe_guc_ct_send(&guc->ct, action, len, g2h_len, num_g2h);
 }
 ```
 
-**That `else` branch is the hot path of the entire driver.** Every frame, every
-compute dispatch, every blit — millions of times — reduces to two dwords in a
-ring buffer.
+That's it. Every frame, every blit, every compute dispatch — **two dwords**.
 
-And the `if` is Idea 2's third state. Note `num_g2h = 1`: enabling scheduling is
-the only one of the two that expects a reply, because the driver must know when
-it has taken effect (for suspend/resume bookkeeping).
+> One wrinkle I'm skipping: if the context has been idle, the GuC turns
+> scheduling *off* for it, and the first submission after that sends a 3-dword
+> "turn scheduling back on" letter instead (and that one does get a reply). The
+> real function has an `if` for it. The steady-state path is the two dwords
+> above.
 
 ---
 
-## Step 4 — Putting a message in the ring
+## Step 4 — How the letter physically lands
 
-**File: `xe_guc_ct.c:941`.** Same circular-buffer shape as Chapter 10, with one
-new trick.
+**`xe_guc_ct.c:941`.** Same shape as Chapter 10's ring write:
 
 ```c
-static int h2g_write(struct xe_guc_ct *ct, const u32 *action, u32 len,
-		     u32 ct_fence_value, bool want_response)
+static int h2g_write(struct xe_guc_ct *ct, const u32 *action, u32 len, ...)
 {
 	struct guc_ctb *h2g = &ct->ctbs.h2g;
 	u32 tail = h2g->info.tail;
 	struct iosys_map map = IOSYS_MAP_INIT_OFFSET(&h2g->cmds,
 						     tail * sizeof(u32));
-	full_len = len + GUC_CTB_HDR_LEN;
 
-	/* Command will wrap, zero fill (NOPs), return and check credits again */
-	if (tail + full_len > h2g->info.size) {
-		xe_map_memset(xe, &map, 0, 0, (h2g->info.size - tail) * sizeof(u32));
-		h2g->info.tail = 0;
-		desc_write(xe, h2g, tail, h2g->info.tail);
-		return -EAGAIN;
-	}
-	// ^^^ DIFFERENT from the LRC ring! Chapter 10 SPLIT a wrapping write in
-	//     two. Here a message must be contiguous, so instead we pad the end
-	//     with zeros, reset the tail to 0, and return -EAGAIN so the caller
-	//     retries from the start of the buffer.
-
-	// The two-dword CT header: format, length, and our sequence number
-	cmd[0] = FIELD_PREP(GUC_CTB_MSG_0_FORMAT, GUC_CTB_FORMAT_HXG) |
-		 FIELD_PREP(GUC_CTB_MSG_0_NUM_DWORDS, len) |
-		 FIELD_PREP(GUC_CTB_MSG_0_FENCE, ct_fence_value);
-	//                                    ^^^^^^^^^^^^^^^ the number the
-	//                                    reply will carry back
-
-	if (want_response)
-		cmd[1] = MAKE_ACTION(GUC_HXG_TYPE_REQUEST, action[0]);
-	else
-		cmd[1] = MAKE_ACTION(GUC_HXG_TYPE_FAST_REQUEST, action[0]);
-	//                       ^^^^^^^^^^^^^^^^^^^^^^^^^ "don't reply to this"
-	//   FAST_REQUEST is the cheap form used for SCHED_CONTEXT.
-
-	/* Write H2G ensuring visible before descriptor update */
+	// 1. copy the letter in at the tail
 	xe_map_memcpy_to(xe, &map, 0, cmd, H2G_CT_HEADERS * sizeof(u32));
 	xe_map_memcpy_to(xe, &map, H2G_CT_HEADERS * sizeof(u32),
 			 action, len * sizeof(u32));
-	xe_device_wmb(xe);
-	//  ^^^ THE SAME BARRIER AS CHAPTER 10, for the same reason: the tail
-	//      update is what publishes the message. If the tail became visible
-	//      first, the GuC would read garbage.
 
+	// 2. make sure it's visible BEFORE we announce it
+	xe_device_wmb(xe);
+	//  ^^^ the same barrier as Chapter 10, for the same reason
+
+	// 3. advance our tail
 	h2g->info.tail = (tail + full_len) % h2g->info.size;
+
+	// 4. announce it, by writing the tail into the shared descriptor
 	desc_write(xe, h2g, tail, h2g->info.tail);
-	//  ^^^ THE NOTIFICATION. Writing the tail into the shared descriptor
-	//      is how the GuC learns there's a message. No doorbell register,
-	//      no interrupt from this side.
+	//  ^^^ THIS is how the GuC learns there's a letter. No doorbell
+	//      register, no interrupt - it polls the descriptor.
+
 	return 0;
 }
 ```
 
-Three things to take from this:
+**Four steps: copy, barrier, advance, announce.** Exactly the ring discipline
+from Chapter 10, with the descriptor playing the part the ring tail played
+there.
 
-* **`xe_device_wmb()` again.** Exactly the barrier from Chapter 10's
-  `xe_lrc_write_ring()`, with the same comment and the same reason. Two ring
-  buffers, one discipline.
-* **Wrapping is handled differently.** The LRC ring splits a write; CT pads and
-  retries. Because a CT *message* must be contiguous to be parsed, while a ring
-  of GPU *commands* doesn't care where it wraps.
-* **`FAST_REQUEST`** is the no-reply form. Submissions use it; that's part of why
-  they're cheap.
-
-### Who holds the lock
-
-`xe_guc_ct_send()` at `:1274` wraps this in `ct->lock`, and there is flow control
-above it: `__guc_ct_send_locked()` at `:1053` checks there's room in H2G **and**
-that there's reserved space in G2H for however many replies this request will
-produce. If not, it drains G2H first. A conversation can't be started that
-there's no room to finish.
-
----
-
-## Step 5 — Replies
-
-**File: `xe_guc_ct.c:1655`.** When the GuC writes into G2H it raises an
-interrupt; the handler queues `g2h_worker`, which drains the buffer and calls:
+And the mailbox struct, for completeness (`xe_guc_ct_types.h`):
 
 ```c
-static int process_g2h_msg(struct xe_guc_ct *ct, u32 *msg, u32 len)
-{
-	action = FIELD_GET(GUC_HXG_EVENT_MSG_0_ACTION, hxg[0]);
+struct guc_ctb_info {
+	u32 size;        // in dwords
+	u32 head;        // where the reader is
+	u32 tail;        // where the writer is
+};
 
-	switch (action) {
-	case XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE:
-		ret = xe_guc_sched_done_handler(guc, payload, adj_len);
-		//    ^^^ "scheduling is now enabled/disabled on that context"
-		//        - the reply to Idea 2's third state
-		break;
-	case XE_GUC_ACTION_DEREGISTER_CONTEXT_DONE:
-		ret = xe_guc_deregister_done_handler(guc, payload, adj_len);
-		//    ^^^ "that context is fully gone, safe to free its LRC"
-		break;
-	case XE_GUC_ACTION_CONTEXT_RESET_NOTIFICATION:
-		ret = xe_guc_exec_queue_reset_handler(guc, payload, adj_len);
-		//    ^^^ "that context hung and I reset it"  (chapter 15)
-		break;
-	case XE_GUC_ACTION_ENGINE_FAILURE_NOTIFICATION:
-		ret = xe_guc_exec_queue_reset_failure_handler(...);
-		break;
-	case XE_GUC_ACTION_NOTIFY_MEMORY_CAT_ERROR:
-		ret = xe_guc_exec_queue_memory_cat_error_handler(...);
-		//    ^^^ a bad memory access - a page table problem (ch 7, 9)
-		break;
-	case XE_GUC_ACTION_REPORT_PAGE_FAULT_REQ_DESC:
-		ret = xe_guc_pagefault_handler(guc, payload, adj_len);
-		//    ^^^ fault-mode VM took a page fault (ch 6's personality)
-		break;
-	case XE_GUC_ACTION_STATE_CAPTURE_NOTIFICATION:
-		ret = xe_guc_error_capture_handler(guc, payload, adj_len);
-		break;
-	...
-	}
-}
+struct xe_guc_ct {
+	struct {
+		struct guc_ctb h2g;    // down
+		struct guc_ctb g2h;    // up
+	} ctbs;
+	struct work_struct g2h_worker;   // drains g2h after an interrupt
+};
 ```
 
-**Read that switch as "everything the GuC can tell you."** It is a short list,
-and almost all of it is bad news — hangs, resets, faults, memory errors. The GuC
-is quiet when things go well.
-
-Notice there is **no "job complete" message.** Completion doesn't come through
-the CT at all: the engine writes a sequence number into the LRC's `seqno_bo`
-(Chapter 10's ring sandwich) and raises a user interrupt, and *that* signals the
-hardware fence. Routing every completion through a microcontroller mailbox would
-be far too slow.
-
-> **Jobs complete through memory and an interrupt. The CT is for control and for
-> trouble.**
+`size`/`head`/`tail` — **the same three fields as `xe_lrc->ring`.** One idea,
+two users.
 
 ---
 
-## Step 6 — The message mechanism
+## What comes back
 
-**File: `xe_guc_submit.c:1938`** — Idea 3's whole vocabulary:
+**`xe_guc_ct.c:1655`.** The GuC writes into G2H, raises an interrupt, and a
+worker calls this:
 
 ```c
-#define CLEANUP          1     /* Non-zero values to catch uninitialized msg */
-#define SET_SCHED_PROPS  2
+	switch (action) {
+	case XE_GUC_ACTION_CONTEXT_RESET_NOTIFICATION:   // "that context hung"
+	case XE_GUC_ACTION_REPORT_PAGE_FAULT_REQ_DESC:   // "it page faulted"
+	case XE_GUC_ACTION_NOTIFY_MEMORY_CAT_ERROR:      // "bad memory access"
+	case XE_GUC_ACTION_SCHED_CONTEXT_MODE_DONE:      // "scheduling enabled"
+	case XE_GUC_ACTION_DEREGISTER_CONTEXT_DONE:      // "context fully gone"
+	...
+	}
+```
+
+**Idea 3, as a switch statement.** Hangs, faults, memory errors, and a few
+acknowledgements. **No "job complete" case** — that arrives as an interrupt from
+the engine instead.
+
+---
+
+## One last thing: suspend and resume
+
+Chapter 10 mentioned that `xe_gpu_scheduler` has a message list. Here's why.
+
+Suspending a queue, changing its priority or tearing it down must not happen
+*while* a job is being submitted. So instead of locking, Xe puts those
+operations **in the same in-order queue as the jobs**:
+
+```c
+#define CLEANUP          1     /* tear this queue down */
+#define SET_SCHED_PROPS  2     /* priority / timeslice */
 #define SUSPEND          3
 #define RESUME           4
 ```
 
-Added to the queue like this (`:2095`):
+The scheduler drains jobs and messages from one list, so a message is
+automatically ordered against the jobs around it. Each one becomes its own H2G
+letter when the scheduler reaches it.
 
-```c
-static void guc_exec_queue_add_msg(struct xe_exec_queue *q,
-				   struct xe_sched_msg *msg, u32 opcode)
-{
-	msg->opcode = opcode & OPCODE_MASK;
-	msg->private_data = q;
-
-	if (opcode & MSG_HEAD)
-		xe_sched_add_msg_head(&q->guc->sched, msg);   // jump the queue
-	else
-		xe_sched_add_msg(&q->guc->sched, msg);        // <<< ordered
-							      // behind the jobs
-}
-```
-
-And each one, when the scheduler reaches it, becomes an H2G message. For example
-`SUSPEND` sends `SCHED_CONTEXT_MODE_SET` with `GUC_CONTEXT_DISABLE` and waits
-for the `MODE_DONE` reply from step 5.
-
-**That `MSG_HEAD` option is worth noting**: teardown can jump ahead of pending
-jobs, because if the queue is being destroyed there's no point running them.
-Everything else goes to the back, which is Idea 3's ordering guarantee.
-
-These are what Chapter 10's `xe_exec_queue_ops` entries actually do —
-`set_priority`, `suspend`, `resume`, `fini` are all "post a message".
+That's what Chapter 10's `xe_exec_queue_ops` entries actually do: post a
+message.
 
 ---
 
-## Our submission, end to end
+## The whole flow
 
 ```
-  Chapter 11 ends: all dependencies signalled, worker calls run_job()
-        |
-  guc_exec_queue_run_job()              xe_guc_submit.c:1205
-        |
-        +-- not registered? -> register_exec_queue()    :985
-        |     H2G[12]: REGISTER_CONTEXT { ..., hwlrca = GGTT addr of LRC }
-        |
-        +-- q->ring_ops->emit_job(job)                  CHAPTER 10
-        |     writes the command sandwich into the LRC ring
-        |
-        +-- submit_exec_queue()                         :1145
-        |     xe_lrc_set_ring_tail()  -> publish the tail
-        |     not enabled? H2G[3]: SCHED_CONTEXT_MODE_SET { id, ENABLE }
-        |     else         H2G[2]: SCHED_CONTEXT         { id }
-        |         |
-        |         +-- xe_guc_ct_send()                  xe_guc_ct.c:1274
-        |               h2g_write()                     :941
-        |                 memcpy into the H2G ring
-        |                 xe_device_wmb()
-        |                 desc_write(tail)   <-- the GuC now knows
-        |
-        +-- return job->fence                           (Chapter 11's "parent")
+  run_job()                              xe_guc_submit.c:1205
+     |
+     1. emit_job()           -> commands into the LRC ring    (ch 10)
+     |
+     2. register_exec_queue() (first use only)                 :985
+     |     letter: REGISTER_CONTEXT { ..., hwlrca = GGTT addr }
+     |
+     3. submit_exec_queue()                                    :1145
+     |     set_ring_tail()
+     |     letter: SCHED_CONTEXT { guc_id }       <-- two dwords
+     |       |
+     |       +-- h2g_write()                      xe_guc_ct.c:941
+     |             copy -> barrier -> advance -> announce
+     |
+     4. return the fence
 
-  ... GuC schedules the context onto an engine ...
-  ... engine reads the ring, runs the batch, writes seqno ...
-  ... user interrupt -> hardware fence signals -> "finished" signals ...
+  ... GuC picks it up, runs it on an engine ...
+  ... engine writes a seqno, raises an interrupt, fence signals ...
 
-  meanwhile, if anything goes wrong:
-     GuC writes G2H -> interrupt -> g2h_worker -> process_g2h_msg()  :1655
+  if something breaks: GuC writes G2H -> interrupt -> worker -> switch
 ```
 
-## Try it on your machine
+## Try it
 
 ```bash
-# every message in both directions
 echo 1 > /sys/kernel/debug/tracing/events/xe/xe_guc_ctb_h2g/enable
-echo 1 > /sys/kernel/debug/tracing/events/xe/xe_guc_ctb_g2h/enable
-echo 1 > /sys/kernel/debug/tracing/events/xe/xe_exec_queue_submit/enable
 cat /sys/kernel/debug/tracing/trace_pipe
-
-# the CT state, and the GuC's own log
-cat /sys/kernel/debug/dri/0/gt0/guc_ct
-cat /sys/kernel/debug/dri/0/gt0/guc_log
 ```
 
-Run something graphical with `xe_guc_ctb_h2g` enabled and watch the flood of
-2-dword `SCHED_CONTEXT` messages. That's Idea 2, live.
+Run anything graphical and watch the flood of 2-dword `SCHED_CONTEXT` letters.
+That's Idea 2, live.
 
 ## Checkpoint
 
-1. A submission sends only an action code and a context ID. How does the GuC know
-   where the batch buffer is?
-2. `h2g_write()` pads the buffer with zeros and returns `-EAGAIN` when a message
-   would wrap, but `xe_lrc_write_ring()` splits the write in two. Why the
-   difference?
-3. What tells the GuC that a new message is waiting?
-4. There is no "job complete" message in `process_g2h_msg()`. How does the driver
-   learn a job finished?
-5. Why does Xe put suspend/resume/priority changes in the scheduler's queue
-   instead of just calling them directly?
+1. A submission sends only an action code and an ID number. How does the GuC find
+   the batch buffer?
+2. What tells the GuC a new letter is waiting?
+3. Why is there no "job complete" message in the G2H mailbox?
+4. What are the four steps of `h2g_write()`, and which one is the announcement?
 
 <details>
 <summary>answers</summary>
 
-1. It doesn't, and it doesn't need to. The batch address was written into the
-   LRC's ring by `emit_job()` as an `MI_BATCH_BUFFER_START` command. The GuC only
-   needs to know *which context* has work; the context's LRC — whose GGTT address
-   it was given at registration — contains the ring, and the ring contains the
-   command.
-2. Because a CT message has a header declaring its length and must be contiguous
-   to be parsed. A ring of GPU commands has no such constraint — the command
-   streamer simply wraps. So CT pads to the end and retries from offset 0, while
-   the LRC ring splits.
-3. The driver writing the new tail value into the shared CT descriptor. There is
-   no doorbell register and no interrupt in the H2G direction — the GuC polls the
-   descriptor.
-4. Through memory and an interrupt, not the CT. The engine's last commands write
-   a sequence number into the LRC's `seqno_bo` and raise a user interrupt; the
-   interrupt handler signals the hardware fence whose seqno has been reached.
-   Routing completions through the mailbox would be far too slow.
-5. Ordering. Those operations must not interleave with job submission — tearing
-   down a queue with jobs in flight, or changing priority mid-submit, is
-   undefined. Putting them in the same in-order queue as the jobs makes them
-   ordered against the jobs for free, with no additional locking.
+1. It doesn't look for it. The batch address was written into the LRC's ring by
+   `emit_job()` as a command. The GuC only needs to know *which context* has
+   work; the LRC — whose GGTT address it got at registration — contains the ring,
+   and the ring contains the command.
+2. The driver writing its new tail value into the shared CT descriptor. There's
+   no doorbell register and no interrupt in that direction — the GuC polls it.
+3. Speed. Completion happens constantly, and routing each one through a
+   microcontroller's mailbox would be far too slow. Instead the engine writes a
+   sequence number into memory and raises an interrupt, and the interrupt handler
+   signals the fence.
+4. Copy the letter in at the tail; write barrier; advance the local tail; write
+   the tail into the shared descriptor. The fourth one is the announcement — and
+   the barrier before it exists so the GuC can never see the announcement before
+   the letter.
 
 </details>
