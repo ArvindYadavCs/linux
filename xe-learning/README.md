@@ -68,3 +68,4 @@ Nothing else depends on these; read them whenever.
 * [10 — The Scheduling Cast](10-the-scheduling-cast.md) — story + code + LRC appendix
 * [11 — The Waiting Room](11-the-scheduler.md) — story + code
 * [12 — Talking to the GuC](12-talking-to-the-guc.md) — story + code
+* [13 — EXEC, End to End](13-exec-end-to-end.md) — story + code
