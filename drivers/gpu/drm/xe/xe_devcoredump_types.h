@@ -86,6 +86,8 @@ struct xe_devcoredump {
 	struct mutex lock;
 	/** @captured: The snapshot of the first hang has already been taken */
 	bool captured;
+	/** @disabled: Driver is unbinding, no new snapshot may be taken */
+	bool disabled;
 	/** @snapshot: Snapshot is captured at time of the first crash */
 	struct xe_devcoredump_snapshot snapshot;
 };
