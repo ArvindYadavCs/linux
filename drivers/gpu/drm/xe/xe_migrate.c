@@ -1827,7 +1827,7 @@ xe_migrate_update_pgtables_cpu(struct xe_migrate *m,
 			return ERR_PTR(err);
 	}
 
-	for (i = 0; i < pt_update_ops->num_ops; ++i) {
+	for (i = 0; i < pt_update_ops->current_op; ++i) {
 		const struct xe_vm_pgtable_update_op *pt_op =
 			&pt_update_ops->ops[i];
 
@@ -1873,7 +1873,7 @@ __xe_migrate_update_pgtables(struct xe_migrate *m,
 	bool is_migrate = pt_update_ops->q == m->q;
 	bool usm = is_migrate && xe->info.has_usm;
 
-	for (i = 0; i < pt_update_ops->num_ops; ++i) {
+	for (i = 0; i < pt_update_ops->current_op; ++i) {
 		struct xe_vm_pgtable_update_op *pt_op = &pt_update_ops->ops[i];
 		struct xe_vm_pgtable_update *updates = pt_op->entries;
 
@@ -1941,7 +1941,7 @@ __xe_migrate_update_pgtables(struct xe_migrate *m,
 			bb->cs[bb->len++] = ofs;
 			bb->cs[bb->len++] = 0; /* upper_32_bits */
 
-			for (; i < pt_update_ops->num_ops; ++i) {
+			for (; i < pt_update_ops->current_op; ++i) {
 				struct xe_vm_pgtable_update_op *pt_op =
 					&pt_update_ops->ops[i];
 				struct xe_vm_pgtable_update *updates = pt_op->entries;
@@ -1978,7 +1978,7 @@ next_cmd:
 
 		addr = xe_migrate_vm_addr(ppgtt_ofs, 0) +
 			(page_ofs / sizeof(u64)) * XE_PAGE_SIZE;
-		for (i = 0; i < pt_update_ops->num_ops; ++i) {
+		for (i = 0; i < pt_update_ops->current_op; ++i) {
 			struct xe_vm_pgtable_update_op *pt_op =
 				&pt_update_ops->ops[i];
 			struct xe_vm_pgtable_update *updates = pt_op->entries;
@@ -1996,7 +1996,7 @@ next_cmd:
 		bb->cs[bb->len++] = MI_BATCH_BUFFER_END;
 		update_idx = bb->len;
 
-		for (i = 0; i < pt_update_ops->num_ops; ++i) {
+		for (i = 0; i < pt_update_ops->current_op; ++i) {
 			struct xe_vm_pgtable_update_op *pt_op =
 				&pt_update_ops->ops[i];
 			struct xe_vm_pgtable_update *updates = pt_op->entries;
