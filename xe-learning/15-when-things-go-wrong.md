@@ -236,10 +236,56 @@ This is Chapter 10 paying off. The ring is just memory with a head and a
 tail — rewind the tail, replay. **An innocent app never learns that a GT
 reset happened.**
 
+### Step 4b — The reset budget: two tries, then give up
+
+A GT reset is not retried forever. Each job carries a **karma** counter;
+every timeout that reaches the reset branch bumps it:
+
+```c
+// include/drm/gpu_scheduler.h:715
+return s_job && atomic_inc_return(&s_job->karma) > threshold;
+```
+
+```c
+// xe_guc_submit.c:1652
+if (!xe_sched_invalidate_job(job, 2)) {    // karma++ ; still <= 2?
+	clear_exec_queue_banned(q);         // un-blame the app...
+	xe_gt_reset_async(q->gt);           // ...and reset; job gets resubmitted
+	goto rearm;
+}
+
+// karma > 2 -> two resets already happened and it STILL hangs.
+// A third reset will not help either.
+if (q->flags & EXEC_QUEUE_FLAG_KERNEL) {
+	xe_gt_WARN(q->gt, true, "Kernel-submitted job timed out\n");
+	wedge_device = true;                // -> rung 4
+}
+```
+
+So for a **driver-submitted (KERNEL) queue** the sequence is:
+
+| Timeout | karma | `> 2`? | Action |
+|---|---|---|---|
+| 1st | 1 | no | GT reset #1, job resubmitted |
+| 2nd | 2 | no | GT reset #2, job resubmitted |
+| 3rd | 3 | **yes** | no more resets -> **wedge the device** |
+
+**Two resets, two resubmissions, wedge on the third timeout.** Every reset
+may have succeeded perfectly — the device is wedged because the driver's own
+machinery still cannot run, and there is nothing left to try.
+
+A **user** queue hitting karma > 2 does *not* wedge: `wedge_device` is
+guarded by `EXEC_QUEUE_FLAG_KERNEL`. The queue simply stays banned.
+
 ### Step 5 — Rung 4: wedge
 
-Only reached when recovery itself failed: the reset didn't complete, or the
-firmware won't load.
+Three ways in, not one:
+
+1. a GT reset **failed** (didn't complete, or firmware won't load),
+2. the reset budget above **ran out** on a kernel queue,
+3. `wedged_mode=2` — a debug setting that wedges on *any* hang and disables
+   resets, so the broken hardware state is preserved for inspection
+   (`guc_submit_hint_wedged()`, `xe_guc_submit.c:1352`).
 
 ```c
 // xe_device.c:1453
@@ -298,5 +344,8 @@ genuinely doesn't know which door it came in through.
 3. **Nothing is ever left waiting.** `-ETIME` for the culprit, `-ECANCELED`
    for its neighbours, a wakeup for user-fence sleepers, and a uevent even
    when the device is beyond saving.
+4. **A wedge means the driver is out of options** — not necessarily that
+   recovery broke. Recovery can succeed twice and the device still wedges,
+   because the job hangs anyway.
 
 Next: Chapter 16 — the life of one frame, through every layer of this course.
