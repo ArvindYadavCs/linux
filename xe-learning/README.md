@@ -71,3 +71,4 @@ Nothing else depends on these; read them whenever.
 * [13 — EXEC, End to End](13-exec-end-to-end.md) — story + code
 * [14 — The Program That Never Ends](14-the-endless-program.md) — story + code
 * [15 — When Things Go Wrong](15-when-things-go-wrong.md) — story + code
+* [16 — The Life of One Frame](16-life-of-one-frame.md) — the capstone
