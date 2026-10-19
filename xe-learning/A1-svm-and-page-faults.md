@@ -205,6 +205,79 @@ out:
 }
 ```
 
+#### Why step (a) is first, and why it is inline
+
+The MMU notifier that handles a `munmap` of a mirrored range runs with the
+notifier lock held for write: it cannot sleep and cannot submit GPU work.
+So it only does what is possible there:
+
+```c
+// xe_svm.c:133
+drm_gpusvm_range_set_unmapped(&range->base, &range->pages, 1, mmu_range);
+spin_lock(&vm->svm.garbage_collector.lock);
+list_add_tail(&range->garbage_collector_link,
+	      &vm->svm.garbage_collector.range_list);
+spin_unlock(&vm->svm.garbage_collector.lock);
+queue_work(xe->usm.pf_wq, &vm->svm.garbage_collector.work);
+```
+
+The real teardown submits GPU work and waits, so it needs process context:
+
+```c
+// xe_svm.c:304
+fence = xe_vm_range_unbind(vm, range);        // GPU work: tear down PTEs
+dma_fence_put(fence);
+drm_gpusvm_unmap_pages(...);                  // dma_unmap
+drm_gpusvm_range_remove(&vm->svm.gpusvm, &range->base);   // out of the tree
+```
+
+**So the range tree legitimately contains zombies** — ranges marked
+`unmapped`, still in the tree, pages already returned to the kernel.
+
+The handler cannot wait for the worker to clear them, because the worker
+needs the very lock the handler is holding:
+
+```c
+// xe_svm.c:437               |  // xe_pagefault.c:190
+down_write(&vm->lock);        |  down_write(&vm->lock);   // the handler, already
+xe_svm_garbage_collector(vm); |                           // holding it
+up_write(&vm->lock);          |
+```
+
+So it calls the same function inline. One function, two callers — the
+worker takes the lock, the handler already has it
+(`lockdep_assert_held_write(&vm->lock)` satisfies both).
+
+Three things break without it:
+
+1. **A leak.** `find_or_insert()` could return a zombie, and the handler
+   would DMA-map and bind pages the app no longer owns.
+2. **An infinite fault loop.** The notifier only *zapped* the PTEs; the
+   range still records a binding, so `xe_svm_range_is_valid()` says "already
+   bound", the handler returns 0 having bound nothing, and the GPU faults on
+   the same address forever.
+3. **A dangling `xe_vma *`.** Collecting a range can *restructure* the VMA
+   layout and says so explicitly:
+
+```c
+// xe_svm.c:368 (xe_svm_range_set_default_attr)
+err = xe_vm_alloc_cpu_addr_mirror_vma(vm, start, end - start);   // NEW VMA
+/*
+ * On call from xe_svm_handle_pagefault original VMA might be changed
+ * signal this to lookup for VMA again.
+ */
+return -EAGAIN;
+```
+
+That `-EAGAIN` travels out to the outer wrapper, which re-resolves the VMA
+from scratch (`xe_svm.c:1418`). Draining *first* means that discovery
+happens before anything is committed; draining later would leave the
+handler mid-bind on a freed VMA.
+
+Note also that step (a) sits **inside** the `retry:` label, so it runs
+again on every retry — a retry means time passed, and more ranges may have
+been queued meanwhile.
+
 Look at step (e): **the fault handler reuses Chapter 8's bind path
 verbatim.** Fault mode didn't add a new way to write page tables. It only
 changed *who decides when* — which is Chapter 16's Idea 3 in action: one
