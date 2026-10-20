@@ -234,8 +234,40 @@ drm_gpusvm_range_remove(&vm->svm.gpusvm, &range->base);   // out of the tree
 **So the range tree legitimately contains zombies** — ranges marked
 `unmapped`, still in the tree, pages already returned to the kernel.
 
-The handler cannot wait for the worker to clear them, because the worker
-needs the very lock the handler is holding:
+**It is a race, not a pipeline.** The collector work and the page-fault
+work sit on the *same unordered* workqueue:
+
+```c
+// xe_pagefault.c:400 — WQ_UNBOUND, max_active > 1: these run concurrently
+xe->usm.pf_wq = alloc_workqueue("xe_page_fault_work_queue",
+				WQ_UNBOUND | WQ_HIGHPRI,
+				XE_PAGEFAULT_QUEUE_COUNT);
+
+// xe_svm.c:149        — the collector is queued on it
+// xe_pagefault.c:488  — and so is the fault worker
+```
+
+So two orders are possible:
+
+```
+  A) worker wins             B) fault wins (why the inline call exists)
+  ---------------            --------------------------------------------
+  munmap -> list + queue     munmap -> list + queue
+  worker: vm->lock           handler: vm->lock          <- first
+  worker: unbind + remove    worker: vm->lock           <- BLOCKS
+  fault: vm->lock            handler: drains the list ITSELF
+  handler: list EMPTY,       handler: binds a correct range
+           returns at once   worker: wakes, list empty, nothing to do
+```
+
+In case A the inline call costs one spinlock and one `list_empty()` check.
+In case B it is the only thing standing between the handler and a dirty
+tree. And the fault is often **already in flight before the `munmap`** — a
+hardware fault and a syscall have no ordering between them — so queueing
+earlier could not have helped.
+
+The handler cannot wait for the worker, because the worker needs the very
+lock the handler is holding:
 
 ```c
 // xe_svm.c:437               |  // xe_pagefault.c:190
