@@ -74,3 +74,7 @@ Nothing else depends on these; read them whenever.
 * [16 — The Life of One Frame](16-life-of-one-frame.md) — the capstone
 * [A1 — Memory That Isn't There Yet](A1-svm-and-page-faults.md) — SVM and page faults
 * [A2 — When the Lights Go Out](A2-sleep-and-sharing.md) — pinning, suspend/resume, dma-buf
+
+---
+
+**[CHEATSHEET.md](CHEATSHEET.md)** — one-page reference: struct map, file map, call chains, lock order, flags, PTE bits, fence vocabulary, symptom index.
